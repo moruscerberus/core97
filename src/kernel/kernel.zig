@@ -23,10 +23,6 @@ const network = @import("../drivers/network.zig");
 const usb = @import("../drivers/usb.zig");
 const guest = @import("../drivers/guest.zig");
 const input = @import("../drivers/input.zig");
-const process = @import("process.zig");
-const scheduler = @import("scheduler.zig");
-const user_demo = @import("../userland/user_demo.zig");
-const attack_demo = @import("../userland/attack_demo.zig");
 
 // --- CPU exception handling ---
 // Called from interrupts.asm when a CPU exception (0-19) occurs.
@@ -203,37 +199,22 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     // interrupts are enabled - mouse.init() below does the `sti`.
     pit.init(100);
 
-    // Reserves the dedicated, exclusive per-process memory regions (see
-    // process.zig's header comment on why each process needs its own
-    // never-shared 4 MiB region for isolation to actually hold) before
-    // anything can be allocated from them.
-    process.init();
-
-    // Two copies of the same tiny demo program (userland/user_demo.zig),
-    // each patched with a different visible ID, running in ring 3.
-    // Scheduling is priority-weighted (see scheduler.zig) specifically
-    // because plain round-robin starved USB HID polling the first time
-    // this was tried - the kernel loop now keeps ~90% of ticks. Each
-    // process also gets its own page directory (process.zig + paging.zig)
-    // so they're truly isolated from each other and from the kernel, not
-    // just privilege-separated.
-    _ = process.create(&user_demo.image, user_demo.id_patch_offset, 'A');
-    _ = process.create(&user_demo.image, user_demo.id_patch_offset, 'B');
-
-    // OFF BY DEFAULT - deliberately set to `true` only when you want to
-    // prove per-process isolation actually blocks cross-process memory
-    // access (see userland/attack_demo.asm). Process creation order
-    // matters: this MUST be created third, after A and B, because it
-    // targets B's region by its known fixed address. Expected result if
-    // isolation works: an immediate page fault / crash screen the
-    // moment this process runs - that crash IS success, not a bug. If
-    // you instead see '!' characters appearing, isolation is broken.
-    const ENABLE_ISOLATION_TEST = false;
-    if (ENABLE_ISOLATION_TEST) {
-        _ = process.create(&attack_demo.image, attack_demo.image.len, 0);
-    }
-
-    scheduler.start();
+    // Userspace infrastructure (gdt.init() above, plus process.zig,
+    // scheduler.zig, paging.zig's per-process directories, and the
+    // int 0x80 syscall gate in idt.zig) is wired in and was verified
+    // working end-to-end - ring 3 execution, preemptive scheduling, and
+    // real per-process memory isolation (a deliberate cross-process
+    // write was confirmed to page-fault rather than succeed). None of
+    // it is exercised right now: there's no program loader yet, so
+    // there's nothing real to schedule. scheduler.start() is
+    // deliberately NOT called here - scheduler_tick stays a no-op
+    // (returns the same esp it's given) until something calls it,
+    // meaning the kernel main loop below keeps 100% of the CPU exactly
+    // like before this phase. The two demo programs that proved all of
+    // this works (userland/user_demo.asm, userland/attack_demo.asm)
+    // were removed once they'd served their purpose - this comment is
+    // the record of what was checked and how, for whoever picks this
+    // back up when there's an actual loader to feed it.
 
     keyboard.setKeyHandler(desktop.onKeyPress);
     keyboard.setEventHandler(desktop.onKeyEvent);

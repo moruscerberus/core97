@@ -27,6 +27,7 @@ const taskbar = @import("taskbar.zig");
 const cursor = @import("cursor.zig");
 const power = @import("../kernel/power.zig");
 const ui = @import("ui.zig");
+const desktop_icons = @import("desktop_icons.zig");
 
 const SLOT_NOTEPAD: usize = 0;
 const SLOT_EXPLORER: usize = 1;
@@ -195,6 +196,7 @@ fn drawShutdownDialog() void {
 
 fn drawSceneContents() void {
     fb.fillRect(0, 0, fb.fb_width, fb.fb_height, fb.CORE97_TEAL);
+    desktop_icons.draw();
     manager.drawAll();
 
     var entries_buf: [window.MAX_WINDOWS]taskbar.TaskbarEntry = undefined;
@@ -215,6 +217,12 @@ pub fn redrawScene() void {
 var prev_left_button: bool = false;
 var prev_right_button: bool = false;
 var last_hover_redraw_tick: u32 = 0;
+// True while a desktop-icon drag or rubber-band selection (see
+// desktop_icons.zig) is in progress - lets the mouse-move/release
+// handling below route to desktop_icons instead of the window manager's
+// own dragging/resizing logic, which doesn't apply since no window slot
+// was involved in starting this interaction.
+var desktop_interaction_active: bool = false;
 
 pub fn onMouseUpdate() void {
     ui.setHover(mouse.mouse_x, mouse.mouse_y);
@@ -315,6 +323,28 @@ pub fn onMouseUpdate() void {
         consumeTaskManagerRequests();
         consumeCommandPromptLaunch();
 
+        if (result.slot == null and button == .left) {
+            desktop_icons.onMouseDown(mouse.mouse_x, mouse.mouse_y);
+            desktop_interaction_active = true;
+        }
+
+        prev_left_button = mouse.left_button;
+        prev_right_button = mouse.right_button;
+        redrawScene();
+        return;
+    }
+
+    if (desktop_interaction_active) {
+        if (mouse.left_button) {
+            desktop_icons.onMouseDrag(mouse.mouse_x, mouse.mouse_y);
+        } else {
+            switch (desktop_icons.onMouseUp()) {
+                .none => {},
+                .open_my_computer => launchExplorerFresh(),
+                .open_documents => openDocuments(),
+            }
+            desktop_interaction_active = false;
+        }
         prev_left_button = mouse.left_button;
         prev_right_button = mouse.right_button;
         redrawScene();

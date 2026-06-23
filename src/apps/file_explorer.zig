@@ -3,9 +3,33 @@
 const fb = @import("../gui/framebuffer.zig");
 const vfs = @import("../fs/vfs.zig");
 const ui = @import("../gui/ui.zig");
+const selection = @import("../gui/selection.zig");
 
 pub var open: bool = false;
 var current: vfs.NodeHandle = vfs.INVALID_HANDLE;
+
+// Drag-to-select state for the file list (right-hand content pane).
+// Clicking directly on an item still opens it immediately (unchanged
+// behavior) - the rubber band is specifically for dragging across empty
+// space to multi-select several items at once, same as a real desktop
+// file manager. selected_rows is indexed by row position within the
+// CURRENT directory's listing, so it's reset every time `current`
+// changes (see clearSelection() and its call sites) rather than tracking
+// handles directly - simpler, since row order already matches what's
+// drawn.
+var rubber_band: selection.RubberBand = .{};
+const MAX_SELECTABLE_ROWS: usize = 16; // matches vfs.zig's MAX_CHILDREN
+var selected_rows: [MAX_SELECTABLE_ROWS]bool = [_]bool{false} ** MAX_SELECTABLE_ROWS;
+
+// onMouseUp (window.AppVTable) takes no position arguments - it only
+// fires after onMouseDown already gave us the content area once this
+// drag, so we cache it here rather than needing the interface to pass
+// area info to every single callback.
+var last_area: struct { x: u32 = 0, y: u32 = 0, w: u32 = 0, h: u32 = 0 } = .{};
+
+fn clearSelection() void {
+    selected_rows = [_]bool{false} ** MAX_SELECTABLE_ROWS;
+}
 
 const MENU_H: u32 = 16;
 const TOOL_H: u32 = 24;
@@ -21,6 +45,7 @@ pub fn init() void {
 pub fn showRoot() void {
     current = vfs.root;
     open = true;
+    clearSelection();
 }
 
 pub fn currentNode() vfs.NodeHandle {
@@ -37,13 +62,19 @@ pub fn canGoBack() bool {
 pub fn back() void {
     const cur = safeCurrent();
     const parent = vfs.parentOf(cur);
-    if (parent != vfs.INVALID_HANDLE) current = parent;
+    if (parent != vfs.INVALID_HANDLE) {
+        current = parent;
+        clearSelection();
+    }
 }
 
 /// Jumps straight to a specific node (used by the "Documents" Start menu
 /// item to open the explorer at /users/default instead of at the root).
 pub fn navigateTo(handle: vfs.NodeHandle) void {
-    if (handle != vfs.INVALID_HANDLE) current = handle;
+    if (handle != vfs.INVALID_HANDLE) {
+        current = handle;
+        clearSelection();
+    }
 }
 
 fn safeCurrent() vfs.NodeHandle {
@@ -122,9 +153,15 @@ fn drawContents(x: u32, y: u32, w: u32, h: u32) void {
         const hx: u32 = if (hover_x < 0) 0 else @intCast(hover_x);
         const hy: u32 = if (hover_y < 0) 0 else @intCast(hover_y);
         const hovered = hx >= x and hx < x + w and hy >= ry and hy < ry + ROW_H;
-        if (hovered) fb.fillRect(x + 2, ry, w - 4, ROW_H, 0xC0D8FF);
+        const is_selected = row < MAX_SELECTABLE_ROWS and selected_rows[row];
+        // Selection takes visual priority over hover when both apply -
+        // a slightly more saturated blue than the hover tint, so a
+        // persistent multi-select reads differently from "mouse is
+        // currently over this one item".
+        const row_bg = if (is_selected) 0x99C2FF else if (hovered) 0xC0D8FF else fb.CORE97_WHITE;
+        if (is_selected or hovered) fb.fillRect(x + 2, ry, w - 4, ROW_H, row_bg);
         drawIcon(x + 8, ry + 1, is_folder);
-        fb.drawString(x + 30, ry + 6, vfs.nameOf(child), fb.CORE97_BLACK, if (hovered) 0xC0D8FF else fb.CORE97_WHITE);
+        fb.drawString(x + 30, ry + 6, vfs.nameOf(child), fb.CORE97_BLACK, row_bg);
     }
 }
 
@@ -235,10 +272,48 @@ pub fn itemAt(mx: i32, my: i32, x: u32, y: u32, w: u32, h: u32) ?vfs.NodeHandle 
     return child;
 }
 
+/// The screen-space rectangle row `row` occupies in the content pane -
+/// same geometry itemAt() hit-tests against, just exposed per-row so the
+/// rubber band can test "does my selection rect overlap this row" rather
+/// than "what row is the mouse over right now".
+fn itemRowRect(row: usize, x: u32, y: u32, w: u32, h: u32) selection.Rect {
+    _ = h;
+    const body_y = y + MENU_H + TOOL_H + ADDR_H + 2;
+    const right_x = x + 6 + TREE_W;
+    const right_w = w - TREE_W - 10;
+    const iy = body_y + 6;
+    return .{
+        .x = @intCast(right_x),
+        .y = @intCast(iy + @as(u32, @intCast(row)) * ROW_H),
+        .w = right_w,
+        .h = ROW_H,
+    };
+}
+
+/// True if (mx, my) is somewhere inside the content pane's body - the
+/// scrollable file list area - regardless of whether it's actually on
+/// top of an item or in the empty space below/between them. Used to
+/// decide whether an empty-space click should start a rubber-band drag
+/// (as opposed to a click on the tree, toolbar, or menu bar doing
+/// something else entirely).
+fn contentBodyContains(mx: i32, my: i32, x: u32, y: u32, w: u32, h: u32) bool {
+    const body_y = y + MENU_H + TOOL_H + ADDR_H + 2;
+    const right_x = x + 6 + TREE_W;
+    const right_w = w - TREE_W - 10;
+    const ix: i32 = @intCast(right_x);
+    const iy: i32 = @intCast(body_y);
+
+    if (mx < ix or my < iy) return false;
+    if (mx >= ix + @as(i32, @intCast(right_w))) return false;
+    if (my >= @as(i32, @intCast(y + h - STATUS_H))) return false;
+    return true;
+}
+
 pub fn activate(handle: vfs.NodeHandle) bool {
     if (handle == vfs.INVALID_HANDLE) return false;
     if (vfs.kindOf(handle) == .directory) {
         current = handle;
+        clearSelection();
         return true;
     }
     return false;
@@ -361,11 +436,13 @@ pub const Explorer = struct {
     pub fn draw(_: *Explorer, x: u32, y: u32, w: u32, h: u32) void {
         const a = insetOf(x, y, w, h);
         Self.draw(a.x, a.y, a.w, a.h);
+        rubber_band.draw();
         drawContextMenu();
     }
 
     pub fn onMouseDown(_: *Explorer, mx: i32, my: i32, button: window.MouseButton, x: u32, y: u32, w: u32, h: u32) window.AppAction {
         const a = insetOf(x, y, w, h);
+        last_area = .{ .x = a.x, .y = a.y, .w = a.w, .h = a.h };
 
         if (button == .right) {
             openContextMenu(mx, my);
@@ -400,12 +477,34 @@ pub const Explorer = struct {
                 _ = notepad.loadFromVfsFile(handle);
                 return .{ .open_builtin = .notepad };
             }
+            return .none;
+        }
+        // Clicked in the content pane but not on an item - start a
+        // rubber-band drag instead. Replaces any existing selection
+        // immediately (no Shift/Ctrl modifier tracking on mouse events
+        // yet, so this is "select only what the drag covers", not
+        // "add to selection").
+        if (contentBodyContains(mx, my, a.x, a.y, a.w, a.h)) {
+            clearSelection();
+            rubber_band.begin(mx, my);
         }
         return .none;
     }
 
-    pub fn onMouseDrag(_: *Explorer, _: i32, _: i32, _: u32, _: u32, _: u32, _: u32) void {}
-    pub fn onMouseUp(_: *Explorer) void {}
+    pub fn onMouseDrag(_: *Explorer, mx: i32, my: i32, _: u32, _: u32, _: u32, _: u32) void {
+        rubber_band.update(mx, my);
+    }
+
+    pub fn onMouseUp(_: *Explorer) void {
+        const r = rubber_band.end() orelse return;
+        const cur = safeCurrent();
+        const count = vfs.childCount(cur);
+        var row: usize = 0;
+        while (row < count and row < MAX_SELECTABLE_ROWS) : (row += 1) {
+            const row_rect = itemRowRect(row, last_area.x, last_area.y, last_area.w, last_area.h);
+            if (selection.rectsIntersect(r, row_rect)) selected_rows[row] = true;
+        }
+    }
     pub fn onKeyAscii(_: *Explorer, _: u8) void {}
     pub fn onKeyUsb(_: *Explorer, _: u8, _: u8, _: u32) bool {
         return false;

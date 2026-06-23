@@ -136,6 +136,38 @@ pub fn draw3DBorder(x: u32, y: u32, w: u32, h: u32, raised: bool) void {
     fillRect(x + w - 1, y, 1, h, dark);
 }
 
+// Classic "marching ants" rubber-band selection rectangle: an outline
+// made of alternating on/off pixels (dash=3, gap=2) rather than a solid
+// line, so it reads as "this is a selection in progress", not a real
+// border. Used by gui/selection.zig's RubberBand and reusable by any
+// future app that embeds one - see selection.zig's header comment.
+pub fn drawDashedRect(x: i32, y: i32, w: u32, h: u32, color: u32) void {
+    if (w == 0 or h == 0) return;
+    const x0: i32 = x;
+    const y0: i32 = y;
+    const x1: i32 = x + @as(i32, @intCast(w)) - 1;
+    const y1: i32 = y + @as(i32, @intCast(h)) - 1;
+
+    const dash: i32 = 3;
+    const gap: i32 = 2;
+    const period = dash + gap;
+
+    var i: i32 = 0;
+    while (x0 + i <= x1) : (i += 1) {
+        if (@mod(i, period) < dash) {
+            if (x0 + i >= 0 and y0 >= 0) putPixel(@intCast(x0 + i), @intCast(y0), color);
+            if (x0 + i >= 0 and y1 >= 0) putPixel(@intCast(x0 + i), @intCast(y1), color);
+        }
+    }
+    i = 0;
+    while (y0 + i <= y1) : (i += 1) {
+        if (@mod(i, period) < dash) {
+            if (x0 >= 0 and y0 + i >= 0) putPixel(@intCast(x0), @intCast(y0 + i), color);
+            if (x1 >= 0 and y0 + i >= 0) putPixel(@intCast(x1), @intCast(y0 + i), color);
+        }
+    }
+}
+
 pub fn drawChar(x: u32, y: u32, c: u8, fg: u32, bg: u32) void {
     var row: usize = 0;
     while (row < 7) : (row += 1) {
@@ -158,8 +190,7 @@ pub fn drawString(x: u32, y: u32, text: []const u8, fg: u32, bg: u32) void {
 
 // Same 5x7 glyph data as drawChar, but rotated 90 degrees so the text
 // reads going down the screen instead of across it - used for the
-// "CORE 97" logo strip on the side of the Start menu (like the rotated
-// the rotated logo text on a real retro desktop sidebar). Each glyph's original
+// "CORE 97" logo strip on the side of the Start menu. Each glyph's original
 // (col, row) pixel maps to (x + row, y + (4 - col)): the old left-right
 // axis becomes the new top-bottom axis.
 pub fn drawCharVertical(x: u32, y: u32, c: u8, fg: u32, bg: u32) void {
