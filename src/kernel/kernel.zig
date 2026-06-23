@@ -3,6 +3,8 @@
 // editing, or window position itself - just orchestration.
 
 const idt = @import("../arch/x86/idt.zig");
+const paging = @import("../arch/x86/paging.zig");
+const gdt = @import("../arch/x86/gdt.zig");
 const multiboot = @import("multiboot.zig");
 const fault = @import("fault.zig");
 const fb = @import("../gui/framebuffer.zig");
@@ -21,6 +23,10 @@ const network = @import("../drivers/network.zig");
 const usb = @import("../drivers/usb.zig");
 const guest = @import("../drivers/guest.zig");
 const input = @import("../drivers/input.zig");
+const process = @import("process.zig");
+const scheduler = @import("scheduler.zig");
+const user_demo = @import("../userland/user_demo.zig");
+const attack_demo = @import("../userland/attack_demo.zig");
 
 // --- CPU exception handling ---
 // Called from interrupts.asm when a CPU exception (0-19) occurs.
@@ -137,6 +143,21 @@ fn pollUsbKeyboard(dev: usb_hid.UsbDevice) void {
 pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     const info: *multiboot.MultibootInfo = @ptrFromInt(multiboot_info_ptr);
 
+    // Phase 1 virtual memory: identity-mapped 4 MiB pages covering the
+    // full 4 GiB address space. This must run before anything else - if
+    // the identity map is wrong, we want to find out immediately via a
+    // triple fault here, not after the framebuffer/USB/network are
+    // already half-initialized and harder to reason about. Because it's
+    // a 1:1 map, every physical address used below (framebuffer, PCI
+    // BARs, the heap) keeps working exactly as it did with paging off.
+    paging.init();
+
+    // Replaces boot.asm's minimal GDT with the richer one (adds ring-3
+    // code/data segments and a TSS) that userspace needs. Selectors
+    // 0x08/0x10 keep meaning exactly what they did before, so nothing
+    // else has to change just because this ran.
+    gdt.init();
+
     fb.fb_addr = @intCast(info.framebuffer_addr);
     fb.fb_pitch = info.framebuffer_pitch;
     fb.fb_width = info.framebuffer_width;
@@ -181,6 +202,38 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     // Heartbeat timer (IRQ0), ~100Hz. Must be programmed before
     // interrupts are enabled - mouse.init() below does the `sti`.
     pit.init(100);
+
+    // Reserves the dedicated, exclusive per-process memory regions (see
+    // process.zig's header comment on why each process needs its own
+    // never-shared 4 MiB region for isolation to actually hold) before
+    // anything can be allocated from them.
+    process.init();
+
+    // Two copies of the same tiny demo program (userland/user_demo.zig),
+    // each patched with a different visible ID, running in ring 3.
+    // Scheduling is priority-weighted (see scheduler.zig) specifically
+    // because plain round-robin starved USB HID polling the first time
+    // this was tried - the kernel loop now keeps ~90% of ticks. Each
+    // process also gets its own page directory (process.zig + paging.zig)
+    // so they're truly isolated from each other and from the kernel, not
+    // just privilege-separated.
+    _ = process.create(&user_demo.image, user_demo.id_patch_offset, 'A');
+    _ = process.create(&user_demo.image, user_demo.id_patch_offset, 'B');
+
+    // OFF BY DEFAULT - deliberately set to `true` only when you want to
+    // prove per-process isolation actually blocks cross-process memory
+    // access (see userland/attack_demo.asm). Process creation order
+    // matters: this MUST be created third, after A and B, because it
+    // targets B's region by its known fixed address. Expected result if
+    // isolation works: an immediate page fault / crash screen the
+    // moment this process runs - that crash IS success, not a bug. If
+    // you instead see '!' characters appearing, isolation is broken.
+    const ENABLE_ISOLATION_TEST = false;
+    if (ENABLE_ISOLATION_TEST) {
+        _ = process.create(&attack_demo.image, attack_demo.image.len, 0);
+    }
+
+    scheduler.start();
 
     keyboard.setKeyHandler(desktop.onKeyPress);
     keyboard.setEventHandler(desktop.onKeyEvent);

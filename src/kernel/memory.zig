@@ -1,6 +1,11 @@
 // kernel/memory.zig - early physical memory manager + tiny kernel heap.
-// Phase 1: parses the Multiboot memory map, tracks 4 KiB physical pages,
-// and exposes stats for Device Manager. This is not paging/userspace yet.
+// Parses the Multiboot memory map, tracks 4 KiB physical pages, and
+// exposes stats for Device Manager. This is purely physical bookkeeping
+// (which 4 KiB frames are free/used) - virtual memory (the actual
+// page-table identity map, CR0/CR3 setup) lives in arch/x86/paging.zig
+// and is enabled earlier in kernel_main, before this module's init() runs.
+// Userspace (separate address spaces per process) is the next phase
+// after this.
 
 const multiboot = @import("multiboot.zig");
 const fb = @import("../gui/framebuffer.zig");
@@ -75,6 +80,17 @@ fn markRange(addr: u32, len: u32, state: u8) void {
     const end = pageOf(alignUp(addr + len, PAGE_SIZE));
     var p = start;
     while (p < end) : (p += 1) markPage(p, state);
+}
+
+/// Marks [addr, addr+len) as permanently used, so allocPage() never
+/// hands any of it out. Used by process.zig to carve out dedicated,
+/// exclusive regions for per-process isolated memory (see
+/// arch/x86/paging.zig's per-process page directories) - those regions
+/// are assigned by fixed physical address, not via allocPage(), so they
+/// must be reserved here or the general allocator could later give the
+/// same physical pages to something else entirely.
+pub fn reserveRange(addr: u32, len: u32) void {
+    markRange(addr, len, PAGE_USED);
 }
 
 pub fn init(info: *const multiboot.MultibootInfo) void {

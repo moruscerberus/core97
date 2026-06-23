@@ -3,15 +3,19 @@
 ; and restore them before returning with iretd.
 
 global idt_load
+global gdt_load
 global keyboard_isr
 global mouse_isr
 global timer_isr
+global syscall_isr
 global default_isr
 
 extern keyboard_handler
 extern mouse_handler
 extern timer_handler
 extern exception_handler
+extern scheduler_tick
+extern syscall_dispatch
 
 ; Loads the IDT. Receives a pointer to the IDT descriptor (limit+base) as
 ; the first (and only) argument on the stack, per the cdecl convention
@@ -19,6 +23,12 @@ extern exception_handler
 idt_load:
     mov eax, [esp + 4]   ; [esp+0] = return address, [esp+4] = first argument
     lidt [eax]
+    ret
+
+; Loads the GDT. Same calling convention as idt_load above.
+gdt_load:
+    mov eax, [esp + 4]
+    lgdt [eax]
     ret
 
 ; IRQ1 - keyboard
@@ -35,10 +45,49 @@ mouse_isr:
     popa
     iretd
 
-; IRQ0 - PIT timer heartbeat
+; IRQ0 - PIT timer heartbeat AND the preemptive scheduler tick.
+;
+; timer_handler keeps doing exactly what it always did (tick counter,
+; EOI) - that bookkeeping is unrelated to scheduling and shouldn't change
+; just because a scheduler now also runs here.
+;
+; scheduler_tick(current_esp) -> new_esp is the actual context switch:
+; it's handed a pointer to the just-pushed register block (which, taken
+; together with the hardware interrupt frame above it, is a complete,
+; resumable snapshot of whatever was running - see kernel/fault.zig's
+; Registers struct for the exact layout this matches). It saves that
+; into the current process's slot, picks the next ready process, and
+; returns THAT process's previously-saved stack pointer. Once `esp` is
+; repointed at a different process's saved frame, the same popa/iretd
+; below resumes that *different* process instead of the one that was
+; interrupted - that's the entire mechanism preemptive multitasking
+; relies on. Before a scheduler exists (or with only one process ever
+; created), scheduler_tick just hands back the same esp it was given,
+; making this a no-op identical to the old plain timer_isr.
 timer_isr:
     pusha
     call timer_handler
+    push esp
+    call scheduler_tick
+    add esp, 4
+    mov esp, eax
+    popa
+    iretd
+
+; int 0x80 - syscall gate. IDT entry 0x80 is set up with DPL=3 (see
+; idt.zig) specifically so ring-3 code is allowed to trigger this via
+; the `int` instruction; hardware IRQs are unaffected by that DPL check.
+;
+; syscall_dispatch(regs_ptr) callconv(.C) void reads the syscall number
+; and arguments out of the pushed register block (eax/ebx/ecx/edx, same
+; Registers layout as everywhere else in this kernel) and writes a
+; return value back into the eax slot of that same block - so once popa
+; restores it, the ring-3 caller sees its result in EAX as expected.
+syscall_isr:
+    pusha
+    push esp
+    call syscall_dispatch
+    add esp, 4
     popa
     iretd
 

@@ -36,6 +36,8 @@ const network = @import("drivers/network.zig");
 const display = @import("drivers/display.zig");
 const usb = @import("drivers/usb.zig");
 const control_panel = @import("apps/control_panel.zig");
+const scheduler = @import("kernel/scheduler.zig");
+const syscall = @import("kernel/syscall.zig");
 
 // Zig's freestanding panic mechanism looks specifically for a `pub fn
 // panic` declared directly in the *root* module (via @import("root")).
@@ -62,4 +64,6 @@ comptime {
     _ = display.deviceName;
     _ = usb.scan;
     _ = control_panel.asApp;
+    _ = scheduler.scheduler_tick;
+    _ = syscall.syscall_dispatch;
 }

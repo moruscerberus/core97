@@ -85,6 +85,7 @@ extern fn idt_load(ptr: *const IdtPointer) void;
 extern fn keyboard_isr() void;
 extern fn mouse_isr() void;
 extern fn timer_isr() void;
+extern fn syscall_isr() void;
 extern fn default_isr() void;
 
 // Loads a zero-limit IDT and immediately triggers a software interrupt.
@@ -129,6 +130,24 @@ fn setIdtEntry(num: u8, handler: *const fn () callconv(.Naked) void) void {
         .selector = 0x08, // kernel code segment (our own GDT, see boot.asm)
         .zero = 0,
         .type_attr = 0x8E, // present, ring 0, 32-bit interrupt gate
+        .offset_high = @truncate(addr >> 16),
+    };
+}
+
+// Like setIdtEntry, but with DPL=3 in the gate descriptor (0xEE instead
+// of 0x8E) - required for ring-3 code to be allowed to reach this vector
+// via the `int` instruction at all. Without this, int 0x80 from ring 3
+// raises a #GP (the CPU checks the gate's DPL against the caller's CPL
+// for software interrupts specifically; hardware IRQs never go through
+// this check). Used only for the syscall gate (0x80) - every other
+// vector here is kernel-only on purpose.
+fn setUserIdtEntry(num: u8, handler: *const fn () callconv(.Naked) void) void {
+    const addr: u32 = @intFromPtr(handler);
+    idt[num] = IdtEntry{
+        .offset_low = @truncate(addr),
+        .selector = 0x08, // still runs in kernel code once entered - only the *gate* is ring-3-reachable
+        .zero = 0,
+        .type_attr = 0xEE, // present, ring 3, 32-bit interrupt gate
         .offset_high = @truncate(addr >> 16),
     };
 }
@@ -223,6 +242,9 @@ pub fn init() void {
     setIdtEntry(32, @ptrCast(&timer_isr)); // IRQ0 -> interrupt 32+0
     setIdtEntry(33, @ptrCast(&keyboard_isr)); // IRQ1 -> interrupt 32+1
     setIdtEntry(44, @ptrCast(&mouse_isr)); // IRQ12 -> interrupt 32+12
+
+    // Syscall gate. DPL=3 so ring-3 user code can reach it via `int 0x80`.
+    setUserIdtEntry(0x80, @ptrCast(&syscall_isr));
 
     idt_load(&idt_ptr);
     remapPic();
