@@ -8,6 +8,7 @@ const gdt = @import("../arch/x86/gdt.zig");
 const multiboot = @import("multiboot.zig");
 const fault = @import("fault.zig");
 const fb = @import("../gui/framebuffer.zig");
+const vbe = @import("../drivers/vbe.zig");
 const desktop = @import("../gui/desktop.zig");
 const notepad = @import("../apps/notepad.zig");
 const keyboard = @import("../drivers/keyboard.zig");
@@ -22,6 +23,7 @@ const driver_registry = @import("../drivers/driver_registry.zig");
 const network = @import("../drivers/network.zig");
 const usb = @import("../drivers/usb.zig");
 const guest = @import("../drivers/guest.zig");
+const virtio_gpu = @import("../drivers/virtio_gpu.zig");
 const input = @import("../drivers/input.zig");
 
 // --- CPU exception handling ---
@@ -154,25 +156,33 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     // else has to change just because this ran.
     gdt.init();
 
-    fb.fb_addr = @intCast(info.framebuffer_addr);
-    fb.fb_pitch = info.framebuffer_pitch;
-    fb.fb_width = info.framebuffer_width;
-    fb.fb_height = info.framebuffer_height;
-    fb.fb_bpp = info.framebuffer_bpp;
+    fb.real_fb_addr = @intCast(info.framebuffer_addr);
+    fb.real_fb_pitch = info.framebuffer_pitch;
+    fb.real_fb_width = info.framebuffer_width;
+    fb.real_fb_height = info.framebuffer_height;
+    fb.real_fb_bpp = info.framebuffer_bpp;
+    fb.configureCanvas(fb.real_fb_width, fb.real_fb_height);
 
-    if (fb.fb_addr == 0 or fb.fb_bpp != 32) {
+    if (fb.real_fb_addr == 0 or fb.real_fb_bpp != 32 or fb.real_fb_width == 0 or fb.real_fb_height == 0) {
         while (true) {
             asm volatile ("hlt");
         }
     }
 
-    const requested_pixels: usize = @as(usize, fb.fb_width) * @as(usize, fb.fb_height);
-    if (requested_pixels > fb.MAX_BACKBUFFER_PIXELS) {
-        fault.renderResolutionTooLargeScreen(fb.fb_width, fb.fb_height);
-        while (true) {
-            asm volatile ("hlt");
-        }
+    // If GRUB/QEMU handed us a tiny framebuffer, or a weird stretched
+    // fullscreen surface such as 2048x576, switch to a normal crisp VBE
+    // mode before the shell is initialized.  This is the key difference
+    // from the old fullscreen behavior: the OS changes video mode and
+    // renders 1:1 into it instead of letting the VM stretch a 640x480
+    // desktop.  On bare metal or adapters without Bochs VBE, this is a
+    // harmless no-op and the boot framebuffer remains the fallback.
+    const boot_mode = vbe.chooseCrispMode(fb.real_fb_width, fb.real_fb_height);
+    if (boot_mode.w != fb.real_fb_width or boot_mode.h != fb.real_fb_height) {
+        _ = vbe.setMode(boot_mode.w, boot_mode.h);
     }
+
+    // The desktop canvas now follows the active framebuffer size directly.
+    // Runtime mode changes call fb.configureCanvas() again through drivers/vbe.zig.
 
     memory.init(info);
 
@@ -226,6 +236,10 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     // USB: controller detection, initial HID enumeration and later hotplug polling.
     // PS/2 stays enabled as the safe fallback input path; USB HID augments it.
     pci.scanForUhci();
+    // Best-effort auto-resize sensor for QEMU's virtio-gpu path. If no virtio
+    // GPU is present (VirtualBox, bare metal, QEMU std-vga), init() is a no-op
+    // and the Bochs VBE/manual mode path still works.
+    virtio_gpu.init();
     guest.detect();
     network.initAll();
     usb.scan();
@@ -247,6 +261,16 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
     input.chooseAfterEnumeration();
     network.initAll();
     driver_registry.refresh();
+
+    // Best-effort clock correction: the CMOS RTC (drivers/rtc.zig) keeps
+    // time fine on its own, but can drift or simply be wrong if it was
+    // never set correctly. This is silent and non-fatal either way -
+    // ntpSyncDefault() has its own ~2s bounded timeout, so a missing or
+    // not-yet-ready network just means the boot-time attempt does
+    // nothing, same as not having network at all. Control Panel ->
+    // Display has a manual "Sync Time (NTP)" button for retrying anytime.
+    _ = network.ntpSyncDefault();
+
     desktop.redrawScene();
 
     // IMPORTANT: no `hlt` here. USB HID polling is manual/software-driven
@@ -264,6 +288,9 @@ pub export fn kernel_main(multiboot_info_ptr: u32) callconv(.C) void {
             pollUsbKeyboard(dev);
         }
         hotplug_tick += 1;
+        if (virtio_gpu.poll()) {
+            desktop.redrawScene();
+        }
         if (hotplug_tick >= 400) {
             hotplug_tick = 0;
             if (usb.hotplugPoll()) {

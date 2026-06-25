@@ -338,6 +338,125 @@ pub fn resolveHost(name: []const u8) ResolveResult {
     return .{ .ok = false, .ip = .{0,0,0,0}, .source = "unresolved" };
 }
 
+/// User-configurable NTP server hostname (Control Panel -> Display has
+/// an editable field for this). Defaults to ntp.se - Netnod's official
+/// Swedish anycast time service address, which automatically routes to
+/// whichever of their Stratum-1 servers (Stockholm/Göteborg/Malmö/Luleå)
+/// is closest. A real, stable, well-known public service, not a
+/// placeholder - see https://www.netnod.se/ntp for details.
+///
+/// This is genuinely just a default, not a hardcoded assumption about
+/// the user's locale - locale support doesn't exist anywhere else in
+/// this kernel yet (no language/region selection, no localized date
+/// formatting), so there's no broader "Swedish-ness" this is part of.
+/// It's simply a sensible, working starting point until proper locale
+/// support exists to pick a sane default automatically.
+var ntp_server_buf: [64]u8 = [_]u8{0} ** 64;
+var ntp_server_len: usize = 0;
+
+fn ntpServerInit() void {
+    if (ntp_server_len != 0) return; // already set (or already defaulted)
+    const default = "ntp.se";
+    copyBytes(ntp_server_buf[0..default.len], default);
+    ntp_server_len = default.len;
+}
+
+pub fn ntpServerAddress() []const u8 {
+    ntpServerInit();
+    return ntp_server_buf[0..ntp_server_len];
+}
+
+/// Replaces the configured NTP server hostname (or literal IPv4
+/// address - both work, same as any other hostname field in this
+/// kernel, since resolveHost()/dnsResolve() already handle a literal
+/// IP by short-circuiting before any DNS lookup). Silently truncates
+/// anything longer than the buffer rather than erroring - Control
+/// Panel's text field also caps input at the same length, so this is
+/// just defense in depth, not the primary length limit.
+pub fn setNtpServerAddress(addr: []const u8) void {
+    const len = if (addr.len > ntp_server_buf.len) ntp_server_buf.len else addr.len;
+    copyBytes(ntp_server_buf[0..len], addr[0..len]);
+    ntp_server_len = len;
+}
+
+// ---- NTP time sync over UDP ---------------------------------------------
+// Same request/poll/timeout shape as dnsResolve() below - one UDP
+// datagram out, serviceNetwork() polled until a matching reply arrives
+// or the timeout elapses. NTP itself (RFC 5905) is one of the simplest
+// widely-used protocols: the client sends a mostly-zeroed 48-byte
+// packet with just a version/mode byte set, and the server's reply has
+// the current time in its Transmit Timestamp field (bytes 40-43:
+// seconds since 1900-01-01, big-endian). Subtracting 2208988800 (the
+// well-known NTP-to-Unix epoch difference) gives a standard Unix
+// timestamp, which rtc.civilFromUnixTimestamp() turns into a
+// year/month/day/h:m:s the CMOS RTC can store.
+const rtc = @import("rtc.zig");
+
+const NTP_SRC_PORT: u16 = 54322;
+const NTP_UNIX_EPOCH_DIFF: u32 = 2_208_988_800; // 1900-01-01 to 1970-01-01, in seconds
+const NTP_TIMEOUT_TICKS: u32 = 200; // ~2s at 100Hz - a bit more slack than DNS since this often runs once at boot, not interactively
+
+var ntp_pending: bool = false;
+var ntp_resolved_ok: bool = false;
+var ntp_resolved_unix_time: i32 = 0;
+
+fn handleNtpResponse(payload: []const u8) void {
+    if (!ntp_pending or payload.len < 48) return;
+    const seconds_since_1900: u32 = (@as(u32, payload[40]) << 24) | (@as(u32, payload[41]) << 16) | (@as(u32, payload[42]) << 8) | payload[43];
+    // Reject anything before 1970 outright (clearly bogus/malformed -
+    // a real server's clock is never set before its own protocol's
+    // epoch) rather than let the subtraction below wrap around. Keeping
+    // this subtraction in u32 (not i64) matters mechanically here, not
+    // just stylistically: see rtc.civilFromUnixTimestamp's comment on
+    // why 64-bit division/modulo doesn't link in this freestanding
+    // 32-bit kernel at all.
+    if (seconds_since_1900 < NTP_UNIX_EPOCH_DIFF) return;
+    ntp_resolved_unix_time = @intCast(seconds_since_1900 - NTP_UNIX_EPOCH_DIFF);
+    ntp_resolved_ok = true;
+    ntp_pending = false;
+}
+
+/// Sends one NTP client request to `server_ip` and blocks (via
+/// serviceNetwork() polling, same as dnsResolve()) for up to
+/// NTP_TIMEOUT_TICKS waiting for a reply. On success, writes the
+/// resulting time into the CMOS RTC (rtc.setDateTime()) - since CMOS is
+/// battery-backed, this correction persists across reboots, not just
+/// until the next power-off. Returns true only if a reply was actually
+/// received and applied.
+pub fn ntpSync(server_ip: [4]u8) bool {
+    if (adapter_count == 0) return false;
+    var packet = [_]u8{0} ** 48;
+    packet[0] = 0x23; // LI=0, VN=4, Mode=3 (client)
+    ntp_resolved_ok = false;
+    ntp_pending = true;
+    if (!sendUdpDatagram(server_ip, 123, NTP_SRC_PORT, &packet)) {
+        ntp_pending = false;
+        return false;
+    }
+    const start = pit.ticks;
+    while (pit.ticks -% start < NTP_TIMEOUT_TICKS) {
+        serviceNetwork();
+        if (ntp_resolved_ok) {
+            rtc.setDateTime(rtc.civilFromUnixTimestamp(ntp_resolved_unix_time));
+            return true;
+        }
+        if (userAbort()) break;
+    }
+    ntp_pending = false;
+    return false;
+}
+
+/// Convenience wrapper: resolves the configured NTP server (default
+/// ntp.se, see ntpServerAddress() above) by hostname before syncing, so
+/// callers don't need to handle DNS themselves. Falls back to a fixed
+/// Cloudflare NTP IP if DNS resolution fails, rather than giving up
+/// entirely - time.cloudflare.com's address has been stable for years
+/// and serves stratum-1 NTP publicly with no registration needed.
+pub fn ntpSyncDefault() bool {
+    const ip = dnsResolve(ntpServerAddress()) orelse .{162,159,200,1};
+    return ntpSync(ip);
+}
+
 pub const PingResult = struct { reachable: bool, time_ms: usize, note: []const u8 };
 pub fn ping(ip: [4]u8) PingResult {
     if (!linkIsUp()) return .{ .reachable = false, .time_ms = 0, .note = "link down" };
@@ -908,6 +1027,7 @@ fn handleUdpIpv4(pkt: []const u8, ihl: usize) void {
     if (udp_len < 8 or ihl + udp_len > pkt.len) return;
     const payload = udp[8..udp_len];
     if (dst_port == DNS_SRC_PORT and src_port == 53) handleDnsResponse(payload);
+    if (dst_port == NTP_SRC_PORT and src_port == 123) handleNtpResponse(payload);
 }
 
 /// Builds and transmits a single UDP/IPv4/Ethernet frame. IPv4 UDP allows a

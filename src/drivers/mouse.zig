@@ -10,6 +10,7 @@
 
 const idt = @import("../arch/x86/idt.zig");
 const input = @import("input.zig");
+const pit = @import("pit.zig");
 
 const PS2_DATA_PORT: u16 = 0x60;
 const PS2_STATUS_PORT: u16 = 0x64;
@@ -91,11 +92,62 @@ pub var mouse_x: i32 = 400;
 pub var mouse_y: i32 = 300;
 pub var left_button: bool = false;
 pub var right_button: bool = false;
-pub var screen_width: i32 = 1024;
-pub var screen_height: i32 = 768;
+pub var screen_width: i32 = 1280;
+pub var screen_height: i32 = 800;
 
 var packet: [3]u8 = .{ 0, 0, 0 };
 var packet_index: u8 = 0;
+
+// --- Double-click detection ---
+// There was no concept of this anywhere in the kernel before - every
+// click was just "a press happened", with no way to tell a deliberate
+// double-click from two unrelated single clicks. This tracks presses
+// (rising edges of left_button) and flags one as a double-click if it
+// lands within both a time window and a small distance of the previous
+// one - the same two-part test every real desktop environment uses, so
+// a slow click-drag-click doesn't false-positive just because it was
+// quick, and a fast double-tap that drifted a few pixels still counts.
+const DOUBLE_CLICK_MAX_TICKS: u32 = 40; // ~400ms at the 100Hz PIT rate kernel.zig configures
+const DOUBLE_CLICK_MAX_DIST: i32 = 6; // pixels of allowed wobble between the two clicks
+
+var prev_left_button: bool = false;
+var last_click_tick: u32 = 0;
+var last_click_x: i32 = -1000;
+var last_click_y: i32 = -1000;
+var pending_double_click: bool = false;
+
+fn updateClickTracking() void {
+    if (left_button and !prev_left_button) {
+        const dt = pit.ticks -% last_click_tick;
+        const dx_click = mouse_x - last_click_x;
+        const dy_click = mouse_y - last_click_y;
+        const dist_sq = dx_click * dx_click + dy_click * dy_click;
+        if (dt <= DOUBLE_CLICK_MAX_TICKS and dist_sq <= DOUBLE_CLICK_MAX_DIST * DOUBLE_CLICK_MAX_DIST) {
+            pending_double_click = true;
+            // Reset the click history after a successful pair, so a
+            // THIRD quick click doesn't also chain into a second
+            // "double-click" against the previous pair's second click.
+            last_click_tick = 0;
+            last_click_x = -1000;
+            last_click_y = -1000;
+        } else {
+            last_click_tick = pit.ticks;
+            last_click_x = mouse_x;
+            last_click_y = mouse_y;
+        }
+    }
+    prev_left_button = left_button;
+}
+
+/// True at most once per actual double-click, then clears itself -
+/// callers check this once when handling a fresh press (the same
+/// moment they'd otherwise treat it as an ordinary single click) to
+/// decide whether to "open" instead of just "select".
+pub fn consumeDoubleClick() bool {
+    if (!pending_double_click) return false;
+    pending_double_click = false;
+    return true;
+}
 
 var on_mouse_update: ?*const fn () void = null;
 
@@ -131,6 +183,7 @@ pub export fn mouse_handler() callconv(.C) void {
         const flags = packet[0];
         left_button = (flags & 0x01) != 0;
         right_button = (flags & 0x02) != 0;
+        updateClickTracking();
         // x/y are 9-bit signed values: bit 4/5 in flags is the sign bit
         var dx: i32 = @as(i32, packet[1]);
         var dy: i32 = @as(i32, packet[2]);

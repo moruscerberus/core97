@@ -35,7 +35,7 @@ pub fn detect() void {
     is_qemu = has_qemu_vga or has_virtio;
     is_virtual = is_qemu or is_virtualbox or is_vmware;
 
-    scale_percent = if (fb.fb_width >= 1600 or fb.fb_height >= 1000) 200 else if (fb.fb_width >= 1200 or fb.fb_height >= 900) 150 else if (fb.fb_width >= 900 or fb.fb_height >= 700) 125 else 100;
+    scale_percent = 100; // 1:1 crisp pixels; layout follows fb.fb_width/fb.fb_height instead of stretching
 }
 
 pub fn status() []const u8 {

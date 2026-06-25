@@ -9,6 +9,7 @@
 
 const multiboot = @import("multiboot.zig");
 const fb = @import("../gui/framebuffer.zig");
+const vbe = @import("../drivers/vbe.zig");
 
 pub const PAGE_SIZE: u32 = 4096;
 const MAX_TRACKED_MEM: u32 = 256 * 1024 * 1024;
@@ -150,10 +151,22 @@ pub fn init(info: *const multiboot.MultibootInfo) void {
     }
 
     // Never hand out low memory, the kernel image, or the framebuffer.
+    // The framebuffer reservation must use the REAL hardware MMIO range
+    // (real_fb_*) - the logical canvas (fb_width/fb_height) is just a
+    // fixed-size RAM buffer the kernel already owns as part of its own
+    // image, not a separate physical region that needs reserving here.
+    //
+    // Reserves vbe.MAX_FRAMEBUFFER_BYTES (the worst case, not just
+    // whatever size GRUB happened to negotiate at boot) because
+    // drivers/vbe.zig can change the active resolution at runtime
+    // without rebooting. If only the boot-time size were reserved here,
+    // switching to a LARGER resolution later could overlap physical
+    // pages the heap allocator had already handed out to something
+    // else, silently corrupting whichever owns them first.
     markRange(0, 1024 * 1024, PAGE_USED);
     markRange(@intFromPtr(&_kernel_start), kernel_end_addr - @intFromPtr(&_kernel_start), PAGE_USED);
-    if (fb.fb_addr != 0 and fb.fb_pitch != 0 and fb.fb_height != 0) {
-        markRange(@intCast(fb.fb_addr), fb.fb_pitch * fb.fb_height, PAGE_USED);
+    if (fb.real_fb_addr != 0) {
+        markRange(@intCast(fb.real_fb_addr), vbe.MAX_FRAMEBUFFER_BYTES, PAGE_USED);
     }
 }
 

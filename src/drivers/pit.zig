@@ -9,6 +9,7 @@
 // and counting is the foundation those need.
 
 const idt = @import("../arch/x86/idt.zig");
+const audio = @import("audio.zig");
 
 const PIT_CHANNEL0: u16 = 0x40;
 const PIT_COMMAND: u16 = 0x43;
@@ -33,5 +34,6 @@ pub fn init(frequency_hz: u32) void {
 
 pub export fn timer_handler() callconv(.C) void {
     ticks +%= 1;
+    audio.onTimerTick();
     idt.picSendEoi(0);
 }

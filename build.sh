@@ -86,13 +86,32 @@ find_qemu() {
     fi
 }
 
-# Picks the best available "don't stretch the framebuffer" display flag
-# for whatever QEMU build is actually installed. GTK's zoom-to-fit=off
-# is the real fix (default is "on", which scales the guest's 1024x768
-# image to fill the window/screen - exactly the stretched look); SDL
-# doesn't auto-stretch in a window so it's a fine fallback if GTK
-# support wasn't compiled in. Headless (-display none) builds can't
-# show a GUI at all - flagged separately rather than silently failing.
+# Picks the best available display flag for whatever QEMU build is
+# actually installed.
+#
+# GTK's zoom-to-fit=on was tried first (have QEMU's window stretch the
+# guest image to fill whatever size you resize it to) but turned out
+# unreliable in practice - QEMU's own bug tracker has long-running
+# threads about it padding with black bars instead of stretching,
+# inconsistently across versions/backends/GL settings, and that's
+# exactly what happened here: resizing the window left black bars
+# instead of a clean stretch.
+#
+# zoom-to-fit=off goes the other direction, and is the actually
+# reliable one: QEMU resizes the WINDOW itself to exactly match
+# whatever resolution the guest is currently running, every time that
+# changes (this is core, well-tested QEMU behavior, not the flaky
+# zoom-to-fit feature). Paired with the Control Panel -> Display
+# resolution presets (apps/control_panel.zig + drivers/vbe.zig), the
+# workflow inverts: instead of resizing the window and hoping the OS
+# stretches to fit, you pick a resolution in the OS and the window
+# snaps to exactly that size - pixel-perfect by construction, no
+# scaling math on the QEMU side at all.
+#
+# SDL doesn't auto-stretch in a window either, so it's a fine fallback
+# if GTK support wasn't compiled in. Headless (-display none) builds
+# can't show a GUI at all - flagged separately rather than silently
+# failing.
 find_display_flag() {
     local qemu="$1"
     local available
@@ -155,7 +174,16 @@ qemu_hw_args() {
     # Experimental modes:
     #   CORE97_USB_INPUT=1 ./build.sh run   # attach USB keyboard/mouse/tablet
     #   CORE97_AUDIO=1 ./build.sh run       # attach AC97 audio
-    local args="-machine pc -vga std -m 512 -rtc base=localtime,clock=host"
+    # QEMU default: virtio VGA gives us a host-size/resize signal through
+    # drivers/virtio_gpu.zig while still leaving a Bochs-dispi-compatible
+    # linear framebuffer path for drivers/vbe.zig. If a QEMU build/device
+    # does not expose virtio-gpu, the kernel simply falls back to the boot
+    # framebuffer plus manual Control Panel -> Display presets.
+    #
+    # VirtualBox/bare-metal users are unaffected by this script: VBoxVGA uses
+    # the same Bochs VBE mode-set path, and bare metal uses GRUB's selected
+    # framebuffer unless the hardware happens to expose a compatible VBE path.
+    local args="-machine pc -vga virtio -m 512 -rtc base=localtime,clock=host"
 
     # Keep QEMU's standard i8042/PS2 keyboard + mouse active. Do not add any USB
     # HID devices here by default.
@@ -210,6 +238,7 @@ do_run_fullscreen() {
     fi
     echo "Booting $ISO fullscreen with $QEMU..."
     echo "If input doesn't respond: click the window once, or Ctrl+Alt+G to grab/release the mouse."
+    echo "Tip: use QEMU View -> Zoom To Fit OFF for pixel-perfect fullscreen; Core97 will pick a real mode instead of scaling."
     echo "Ctrl+Alt+F toggles fullscreen off; Ctrl+Alt+2 switches to the QEMU monitor if it's stuck."
     # shellcheck disable=SC2086
     "$QEMU" -cdrom "$ISO" $(qemu_hw_args) $DISPLAY_FLAG -full-screen

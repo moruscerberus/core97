@@ -79,63 +79,22 @@ fn drawLabeledHex(y: u32, label: []const u8, value: u32) void {
     var buf: [10]u8 = undefined;
     const hex = writeHex32(&buf, value);
     fb.drawString(20, y, label, TEXT_WHITE, BSOD_BLUE);
-    fb.drawString(20 + @as(u32, @intCast(label.len)) * 6, y, hex, TEXT_WHITE, BSOD_BLUE);
+    fb.drawString(20 + fb.textWidth(label), y, hex, TEXT_WHITE, BSOD_BLUE);
 }
 
-fn writeDecimal(buf: *[10]u8, value: u32) []const u8 {
-    if (value == 0) {
-        buf[0] = '0';
-        return buf[0..1];
-    }
-    var tmp: [10]u8 = undefined;
-    var n = value;
-    var len: usize = 0;
-    while (n > 0) {
-        tmp[len] = @as(u8, @intCast(n % 10)) + '0';
-        n /= 10;
-        len += 1;
-    }
-    var i: usize = 0;
-    while (i < len) : (i += 1) buf[i] = tmp[len - 1 - i];
-    return buf[0..len];
-}
-
-/// Halt screen for when the bootloader handed us a video mode bigger
-/// than MAX_BACKBUFFER_PIXELS can hold. Should be rare now that
-/// boot.asm's multiboot header asks for "no preference" rather than a
-/// fixed 1024x768 - this exists so an unusually large mode fails loudly
-/// instead of silently rendering a corrupted partial screen forever.
-/// Like renderExceptionScreen, this can only safely draw into however
-/// much of the backbuffer actually exists, so the message may only
-/// cover the top portion of an oversized screen - still enough to read.
-pub fn renderResolutionTooLargeScreen(width: u32, height: u32) void {
-    if (fb.fb_addr == 0) return;
-
-    fb.fillRect(0, 0, fb.fb_width, fb.fb_height, BSOD_BLUE);
-    drawLine(20, "CORE97OS - VIDEO MODE TOO LARGE");
-    drawLine(40, "THE BOOTLOADER PICKED A RESOLUTION THIS BUILD");
-    drawLine(55, "DOESN'T HAVE ENOUGH BACKBUFFER MEMORY FOR.");
-
-    var wbuf: [10]u8 = undefined;
-    var hbuf: [10]u8 = undefined;
-    const wtext = writeDecimal(&wbuf, width);
-    const htext = writeDecimal(&hbuf, height);
-    fb.drawString(20, 85, "REQUESTED: ", TEXT_WHITE, BSOD_BLUE);
-    fb.drawString(20 + 11 * 6, 85, wtext, TEXT_WHITE, BSOD_BLUE);
-    fb.drawString(20 + 11 * 6 + @as(u32, @intCast(wtext.len)) * 6, 85, "X", TEXT_WHITE, BSOD_BLUE);
-    fb.drawString(20 + 11 * 6 + @as(u32, @intCast(wtext.len)) * 6 + 6, 85, htext, TEXT_WHITE, BSOD_BLUE);
-
-    drawLine(110, "TRY A SMALLER DISPLAY MODE, OR INCREASE");
-    drawLine(125, "MAX_BACKBUFFER_PIXELS IN gui/framebuffer.zig.");
-
-    fb.presentFrame();
-}
+// writeDecimal and renderResolutionTooLargeScreen used to live here,
+// for a "the bootloader picked a resolution too big for the backbuffer"
+// halt screen. That failure mode no longer exists: the backbuffer is
+// now a fixed LOGICAL_WIDTH x LOGICAL_HEIGHT canvas regardless of real
+// resolution, and presentFrame()/presentRect() scale it to fit whatever
+// GRUB actually negotiated (see framebuffer.zig's header comment) - so
+// there's nothing left to fail loudly about here.
 
 /// Renders a full CPU-exception "blue screen": exception name, error
 /// code, faulting EIP, CR2 (for page faults), and a GP-register dump.
 /// Never returns on its own - the caller halts right after.
 pub fn renderExceptionScreen(exception_num: u32, error_code: u32, eip: u32, regs: *const Registers) void {
-    if (fb.fb_addr == 0) return; // no framebuffer yet - nothing we can draw
+    if (fb.real_fb_addr == 0) return; // no framebuffer yet - nothing we can draw
 
     fb.fillRect(0, 0, fb.fb_width, fb.fb_height, BSOD_BLUE);
 
@@ -169,7 +128,7 @@ pub fn renderExceptionScreen(exception_num: u32, error_code: u32, eip: u32, regs
 /// safety checks in ReleaseSafe builds, etc.) where we only have a
 /// message string and no exception/register context.
 pub fn renderPanicScreen(msg: []const u8) void {
-    if (fb.fb_addr == 0) return;
+    if (fb.real_fb_addr == 0) return;
 
     fb.fillRect(0, 0, fb.fb_width, fb.fb_height, BSOD_BLUE);
     drawLine(20, "CORE97OS - KERNEL PANIC");

@@ -27,7 +27,7 @@ const OUTPUT_WIDTH_CHARS: u32 = 60;
 var output_col: u32 = 0;
 
 fn sysWriteChar(char_code: u32) void {
-    if (fb.fb_addr == 0) return;
+    if (fb.real_fb_addr == 0) return;
     const c: u8 = @truncate(char_code);
     var buf = [1]u8{c};
     const x = OUTPUT_COL_START + output_col * 7;

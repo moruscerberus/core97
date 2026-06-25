@@ -34,6 +34,7 @@ const audio = @import("drivers/audio.zig");
 const guest = @import("drivers/guest.zig");
 const network = @import("drivers/network.zig");
 const display = @import("drivers/display.zig");
+const virtio_gpu = @import("drivers/virtio_gpu.zig");
 const usb = @import("drivers/usb.zig");
 const control_panel = @import("apps/control_panel.zig");
 const scheduler = @import("kernel/scheduler.zig");
@@ -62,6 +63,7 @@ comptime {
     _ = guest.detect;
     _ = network.deviceName;
     _ = display.deviceName;
+    _ = virtio_gpu.init;
     _ = usb.scan;
     _ = control_panel.asApp;
     _ = scheduler.scheduler_tick;

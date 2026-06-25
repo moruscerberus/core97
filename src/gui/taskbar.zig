@@ -3,9 +3,11 @@
 const fb = @import("framebuffer.zig");
 const colors = @import("colors.zig");
 const network = @import("../drivers/network.zig");
+const rtc = @import("../drivers/rtc.zig");
 const ui = @import("ui.zig");
 
-pub const HEIGHT: u32 = 28;
+pub const HEIGHT: u32 = 28; // 1x fallback for legacy callers
+pub fn height() u32 { return HEIGHT * fb.uiScale(); }
 
 const START_X: u32 = 2;
 const START_W: u32 = 78;
@@ -21,9 +23,9 @@ pub const TaskbarEntry = struct { title: []const u8, active: bool };
 /// and by WindowManager's minimize-animation target, so both always
 /// agree on where a given window's button actually is.
 pub fn buttonRect(slot: u32) struct { x: i32, y: i32, w: u32, h: u32 } {
-    const task_y: i32 = @intCast(fb.fb_height - HEIGHT);
+    const task_y: i32 = @intCast(fb.fb_height - height());
     const x: i32 = @intCast(TASKBAR_BUTTONS_X + slot * (TASKBAR_BUTTON_W + TASKBAR_BUTTON_GAP));
-    return .{ .x = x, .y = task_y + 2, .w = TASKBAR_BUTTON_W, .h = HEIGHT - 4 };
+    return .{ .x = x, .y = task_y + 2, .w = TASKBAR_BUTTON_W, .h = height() - 4 };
 }
 
 pub fn buttonHit(mx: i32, my: i32, slot: u32) bool {
@@ -41,14 +43,33 @@ pub fn buttonSlotAt(mx: i32, my: i32, entry_count: u32) ?u32 {
     return null;
 }
 
-const MENU_W: u32 = 188;
-const SIDEBAR_W: u32 = 24;
-const ROW_H: u32 = 22;
+const MENU_W_BASE: u32 = 188;
+const SIDEBAR_W_BASE: u32 = 24;
+const ROW_H_BASE: u32 = 22;
 const ROW_COUNT: u32 = 6; // Programs, Documents, Settings, Find, Help, Run
-const MENU_H: u32 = 10 + ROW_COUNT * ROW_H + 10 + ROW_H + 6;
+const FLYOUT_W_BASE: u32 = 144;
+const FLYOUT_ROW_H_BASE: u32 = 22;
 
-const FLYOUT_W: u32 = 144;
-const FLYOUT_ROW_H: u32 = 22;
+fn menuW() u32 { return MENU_W_BASE * fb.uiScale(); }
+fn sidebarW() u32 { return SIDEBAR_W_BASE * fb.uiScale(); }
+fn rowH() u32 { return ROW_H_BASE * fb.uiScale(); }
+fn menuH() u32 { return (10 + ROW_COUNT * ROW_H_BASE + 10 + ROW_H_BASE + 6) * fb.uiScale(); }
+fn flyoutW() u32 { return FLYOUT_W_BASE * fb.uiScale(); }
+fn flyoutRowH() u32 { return FLYOUT_ROW_H_BASE * fb.uiScale(); }
+
+/// Formats the current RTC time as zero-padded "HH:MM" into a
+/// caller-provided 5-byte buffer (no allocation - this runs every
+/// taskbar redraw, including on every mouse move, so it stays as cheap
+/// as the literal string it replaces).
+fn formatClock(buf: *[5]u8) []const u8 {
+    const t = rtc.nowEuropeStockholm();
+    buf[0] = '0' + (t.hour / 10);
+    buf[1] = '0' + (t.hour % 10);
+    buf[2] = ':';
+    buf[3] = '0' + (t.minute / 10);
+    buf[4] = '0' + (t.minute % 10);
+    return buf[0..5];
+}
 
 fn draw3DBorder(x: u32, y: u32, w: u32, h: u32, raised: bool) void {
     const light = if (raised) colors.WHITE else colors.DARK_GREY;
@@ -60,29 +81,29 @@ fn draw3DBorder(x: u32, y: u32, w: u32, h: u32, raised: bool) void {
 }
 
 pub fn startButtonHit(mx: i32, my: i32) bool {
-    const task_y: i32 = @intCast(fb.fb_height - HEIGHT);
+    const task_y: i32 = @intCast(fb.fb_height - height());
     return my >= task_y and mx >= @as(i32, @intCast(START_X)) and mx <= @as(i32, @intCast(START_X + START_W));
 }
 
 fn menuX() u32 { return 2; }
-fn menuY() u32 { return fb.fb_height - HEIGHT - MENU_H; }
+fn menuY() u32 { return fb.fb_height - height() - menuH(); }
 
-fn rowY(row: u32) u32 { return menuY() + 10 + row * ROW_H; }
+fn rowY(row: u32) u32 { return menuY() + 10 + row * rowH(); }
 fn shutdownRowY() u32 { return rowY(ROW_COUNT) + 6; }
 
 fn rowHit(mx: i32, my: i32, row: u32) bool {
-    const x: i32 = @intCast(menuX() + SIDEBAR_W + 2);
+    const x: i32 = @intCast(menuX() + sidebarW() + 2);
     const y: i32 = @intCast(rowY(row));
-    return mx >= x and mx < x + @as(i32, @intCast(MENU_W - SIDEBAR_W - 4)) and my >= y and my < y + @as(i32, @intCast(ROW_H));
+    return mx >= x and mx < x + @as(i32, @intCast(menuW() - sidebarW() - 4)) and my >= y and my < y + @as(i32, @intCast(rowH()));
 }
 
 pub fn startMenuProgramsHit(mx: i32, my: i32) bool { return rowHit(mx, my, 0); }
 pub fn startMenuDocumentsHit(mx: i32, my: i32) bool { return rowHit(mx, my, 1); }
 
 pub fn startMenuShutdownHit(mx: i32, my: i32) bool {
-    const x: i32 = @intCast(menuX() + SIDEBAR_W + 2);
+    const x: i32 = @intCast(menuX() + sidebarW() + 2);
     const y: i32 = @intCast(shutdownRowY());
-    return mx >= x and mx < x + @as(i32, @intCast(MENU_W - SIDEBAR_W - 4)) and my >= y and my < y + @as(i32, @intCast(ROW_H));
+    return mx >= x and mx < x + @as(i32, @intCast(menuW() - sidebarW() - 4)) and my >= y and my < y + @as(i32, @intCast(rowH()));
 }
 
 /// Anywhere inside the main Start menu panel (used to decide whether a
@@ -90,17 +111,17 @@ pub fn startMenuShutdownHit(mx: i32, my: i32) bool {
 pub fn startMenuContains(mx: i32, my: i32) bool {
     const x: i32 = @intCast(menuX());
     const y: i32 = @intCast(menuY());
-    return mx >= x and mx < x + @as(i32, @intCast(MENU_W)) and my >= y and my < y + @as(i32, @intCast(MENU_H));
+    return mx >= x and mx < x + @as(i32, @intCast(menuW())) and my >= y and my < y + @as(i32, @intCast(menuH()));
 }
 
-fn flyoutX() u32 { return menuX() + MENU_W - 2; }
+fn flyoutX() u32 { return menuX() + menuW() - 2; }
 fn flyoutY() u32 { return rowY(0); }
-fn flyoutH() u32 { return 8 * FLYOUT_ROW_H + 8; }
+fn flyoutH() u32 { return 8 * flyoutRowH() + 8; }
 
 fn flyoutRowHit(mx: i32, my: i32, row: u32) bool {
     const x: i32 = @intCast(flyoutX() + 2);
-    const y: i32 = @intCast(flyoutY() + 4 + row * FLYOUT_ROW_H);
-    return mx >= x and mx < x + @as(i32, @intCast(FLYOUT_W - 4)) and my >= y and my < y + @as(i32, @intCast(FLYOUT_ROW_H));
+    const y: i32 = @intCast(flyoutY() + 4 + row * flyoutRowH());
+    return mx >= x and mx < x + @as(i32, @intCast(flyoutW() - 4)) and my >= y and my < y + @as(i32, @intCast(flyoutRowH()));
 }
 
 pub fn programsFlyoutNotepadHit(mx: i32, my: i32) bool { return flyoutRowHit(mx, my, 0); }
@@ -115,7 +136,7 @@ pub fn programsFlyoutBrowserHit(mx: i32, my: i32) bool { return flyoutRowHit(mx,
 pub fn programsFlyoutContains(mx: i32, my: i32) bool {
     const x: i32 = @intCast(flyoutX());
     const y: i32 = @intCast(flyoutY());
-    return mx >= x and mx < x + @as(i32, @intCast(FLYOUT_W)) and my >= y and my < y + @as(i32, @intCast(flyoutH()));
+    return mx >= x and mx < x + @as(i32, @intCast(flyoutW())) and my >= y and my < y + @as(i32, @intCast(flyoutH()));
 }
 
 fn ditherShadow(x: u32, y: u32, w: u32, h: u32) void {
@@ -129,11 +150,12 @@ fn ditherShadow(x: u32, y: u32, w: u32, h: u32) void {
 }
 
 fn drawStartLogo(x: u32, y: u32) void {
-    fb.fillRect(x, y, 12, 12, colors.RED);
-    fb.fillRect(x + 2, y + 2, 4, 4, colors.WHITE);
-    fb.fillRect(x + 7, y + 2, 4, 4, colors.TEAL);
-    fb.fillRect(x + 2, y + 7, 4, 4, colors.BLUE);
-    fb.fillRect(x + 7, y + 7, 4, 4, 0xFFFF00);
+    // Four-color Windows 95-style flag.
+    fb.fillRect(x + 1, y + 2, 6, 5, 0xFF0000);
+    fb.fillRect(x + 8, y + 1, 6, 5, 0x00A000);
+    fb.fillRect(x + 1, y + 8, 6, 5, 0x0000C0);
+    fb.fillRect(x + 8, y + 7, 6, 5, 0xFFFF00);
+    fb.fillRect(x, y + 1, 1, 13, colors.BLACK);
 }
 
 fn drawFolderIcon(x: u32, y: u32) void {
@@ -175,6 +197,51 @@ fn drawRunIcon(x: u32, y: u32) void {
     fb.fillRect(x + 4, y + 12, 8, 2, colors.DARK_GREY);
 }
 
+
+fn taskLooksLike(title: []const u8, needle: []const u8) bool {
+    if (needle.len > title.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= title.len) : (i += 1) {
+        var ok = true;
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (title[i + j] != needle[j]) { ok = false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+fn drawComputerTiny(x: u32, y: u32) void {
+    fb.fillRect(x + 2, y + 1, 13, 10, colors.GREY);
+    draw3DBorder(x + 2, y + 1, 13, 10, true);
+    fb.fillRect(x + 4, y + 3, 9, 5, colors.BLUE);
+    fb.fillRect(x + 6, y + 12, 6, 2, colors.DARK_GREY);
+}
+
+fn drawTrashTiny(x: u32, y: u32) void {
+    fb.fillRect(x + 4, y + 3, 9, 11, colors.GREY);
+    draw3DBorder(x + 4, y + 3, 9, 11, true);
+    fb.fillRect(x + 3, y + 1, 11, 3, colors.DARK_GREY);
+    fb.drawString(x + 6, y + 6, "x", 0x008000, colors.GREY);
+}
+
+fn drawTaskIcon(title: []const u8, x: u32, y: u32) void {
+    if (taskLooksLike(title, "TRASH")) {
+        drawTrashTiny(x, y);
+    } else if (taskLooksLike(title, "MY COMPUTER")) {
+        drawComputerTiny(x, y);
+    } else if (taskLooksLike(title, "CONTROL")) {
+        drawGearIcon(x, y);
+    } else if (taskLooksLike(title, "COMMAND")) {
+        drawRunIcon(x, y);
+    } else if (taskLooksLike(title, "NOTEPAD")) {
+        drawDocIcon(x, y);
+    } else {
+        drawFolderIcon(x, y);
+    }
+}
+
 fn drawPowerIcon(x: u32, y: u32) void {
     fb.fillRect(x + 6, y, 2, 8, colors.RED);
     fb.fillRect(x + 2, y + 4, 10, 10, colors.RED);
@@ -189,30 +256,30 @@ fn drawArrow(x: u32, y: u32) void {
 }
 
 fn drawMenuRow(x: u32, y: u32, label: []const u8, enabled: bool, has_arrow: bool, icon: *const fn (u32, u32) void) void {
-    const row_w = MENU_W - SIDEBAR_W - 4;
-    const hovered = enabled and ui.hit(x - 2, y, row_w, ROW_H);
+    const row_w = menuW() - sidebarW() - 4;
+    const hovered = enabled and ui.hit(x - 2, y, row_w, rowH());
     const bg = if (hovered) colors.BLUE else colors.GREY;
     const fg = if (!enabled) colors.DARK_GREY else if (hovered) colors.WHITE else colors.BLACK;
-    if (hovered) fb.fillRect(x - 2, y, row_w, ROW_H, bg);
+    if (hovered) fb.fillRect(x - 2, y, row_w, rowH(), bg);
     icon(x + 2, y);
     fb.drawString(x + 24, y + 4, label, fg, bg);
-    if (has_arrow) drawArrow(x + MENU_W - SIDEBAR_W - 16, y + 5);
+    if (has_arrow) drawArrow(x + menuW() - sidebarW() - 16, y + 5);
 }
 
 fn drawStartMenu(programs_open: bool) void {
     const x = menuX();
     const y = menuY();
-    ditherShadow(x + 5, y + 5, MENU_W, MENU_H);
-    fb.fillRect(x, y, MENU_W, MENU_H, colors.GREY);
-    draw3DBorder(x, y, MENU_W, MENU_H, true);
+    ditherShadow(x + 5, y + 5, menuW(), menuH());
+    fb.fillRect(x, y, menuW(), menuH(), colors.GREY);
+    draw3DBorder(x, y, menuW(), menuH(), true);
 
     // Sidebar logo strip with rotated "CORE 97" text, like the real
     // the rotated logo text on a classic retro desktop sidebar.
-    fb.fillRect(x + 3, y + 3, SIDEBAR_W, MENU_H - 6, colors.BLUE);
+    fb.fillRect(x + 3, y + 3, sidebarW(), menuH() - 6, colors.BLUE);
     fb.drawStringVertical(x + 9, y + 10, "CORE 97", colors.WHITE, colors.BLUE);
-    drawStartLogo(x + 6, y + MENU_H - 22);
+    drawStartLogo(x + 6, y + menuH() - 22);
 
-    const item_x = x + SIDEBAR_W + 4;
+    const item_x = x + sidebarW() + 4;
     drawMenuRow(item_x, rowY(0), "Programs", true, true, &drawFolderIcon);
     drawMenuRow(item_x, rowY(1), "Documents", true, true, &drawDocIcon);
     drawMenuRow(item_x, rowY(2), "Settings", false, true, &drawGearIcon);
@@ -220,8 +287,8 @@ fn drawStartMenu(programs_open: bool) void {
     drawMenuRow(item_x, rowY(4), "Help", false, false, &drawHelpIcon);
     drawMenuRow(item_x, rowY(5), "Run...", false, false, &drawRunIcon);
 
-    fb.fillRect(x + SIDEBAR_W + 6, shutdownRowY() - 4, MENU_W - SIDEBAR_W - 12, 1, colors.DARK_GREY);
-    fb.fillRect(x + SIDEBAR_W + 6, shutdownRowY() - 3, MENU_W - SIDEBAR_W - 12, 1, colors.WHITE);
+    fb.fillRect(x + sidebarW() + 6, shutdownRowY() - 4, menuW() - sidebarW() - 12, 1, colors.DARK_GREY);
+    fb.fillRect(x + sidebarW() + 6, shutdownRowY() - 3, menuW() - sidebarW() - 12, 1, colors.WHITE);
     drawMenuRow(item_x, shutdownRowY(), "Shut Down...", true, false, &drawPowerIcon);
 
     if (programs_open) drawProgramsFlyout();
@@ -237,11 +304,11 @@ fn drawScriptIcon(x: u32, y: u32) void {
 
 
 fn drawFlyoutRow(fx: u32, fy: u32, row: u32, label: []const u8, icon: *const fn (u32, u32) void) void {
-    const y = fy + 4 + row * FLYOUT_ROW_H;
-    const hovered = ui.hit(fx + 2, y, FLYOUT_W - 4, FLYOUT_ROW_H);
+    const y = fy + 4 + row * flyoutRowH();
+    const hovered = ui.hit(fx + 2, y, flyoutW() - 4, flyoutRowH());
     const bg = if (hovered) colors.BLUE else colors.GREY;
     const fg = if (hovered) colors.WHITE else colors.BLACK;
-    if (hovered) fb.fillRect(fx + 2, y, FLYOUT_W - 4, FLYOUT_ROW_H, bg);
+    if (hovered) fb.fillRect(fx + 2, y, flyoutW() - 4, flyoutRowH(), bg);
     icon(fx + 6, y);
     fb.drawString(fx + 28, y + 5, label, fg, bg);
 }
@@ -250,9 +317,9 @@ fn drawProgramsFlyout() void {
     const fx = flyoutX();
     const fy = flyoutY();
     const fh = flyoutH();
-    ditherShadow(fx + 5, fy + 5, FLYOUT_W, fh);
-    fb.fillRect(fx, fy, FLYOUT_W, fh, colors.GREY);
-    draw3DBorder(fx, fy, FLYOUT_W, fh, true);
+    ditherShadow(fx + 5, fy + 5, flyoutW(), fh);
+    fb.fillRect(fx, fy, flyoutW(), fh, colors.GREY);
+    draw3DBorder(fx, fy, flyoutW(), fh, true);
 
     drawFlyoutRow(fx, fy, 0, "Notepad", &drawDocIcon);
     drawFlyoutRow(fx, fy, 1, "File Explorer", &drawFolderIcon);
@@ -265,16 +332,18 @@ fn drawProgramsFlyout() void {
 }
 
 pub fn draw(start_menu_open: bool, programs_flyout_open: bool, entries: []const TaskbarEntry) void {
-    const y = fb.fb_height - HEIGHT;
-    fb.fillRect(0, y, fb.fb_width, HEIGHT, colors.GREY);
+    const y = fb.fb_height - height();
+    fb.fillRect(0, y, fb.fb_width, height(), colors.GREY);
     fb.fillRect(0, y, fb.fb_width, 1, colors.WHITE);
+    fb.fillRect(0, y + 1, fb.fb_width, 1, 0xE8E8E8);
 
     const btn_x: u32 = START_X;
     const btn_y: u32 = y + 2;
     const btn_w: u32 = START_W;
-    const btn_h: u32 = HEIGHT - 4;
+    const btn_h: u32 = height() - 4;
     const start_hovered = ui.hit(btn_x, btn_y, btn_w, btn_h);
-    const start_bg = if (start_hovered and !start_menu_open) 0xD8E8FF else colors.GREY;
+    _ = start_hovered;
+    const start_bg = colors.GREY;
     fb.fillRect(btn_x, btn_y, btn_w, btn_h, start_bg);
     draw3DBorder(btn_x, btn_y, btn_w, btn_h, !start_menu_open);
     drawStartLogo(btn_x + 5, btn_y + 5);
@@ -285,10 +354,12 @@ pub fn draw(start_menu_open: bool, programs_flyout_open: bool, entries: []const 
         const ux: u32 = @intCast(r.x);
         const uy: u32 = @intCast(r.y);
         const hovered = ui.hit(ux, uy, r.w, r.h);
-        const bg = if (hovered and !entry.active) 0xD8E8FF else colors.GREY;
+        _ = hovered;
+        const bg = colors.GREY;
         fb.fillRect(ux, uy, r.w, r.h, bg);
         draw3DBorder(ux, uy, r.w, r.h, !entry.active);
-        fb.drawString(ux + 8, uy + 6, entry.title, colors.BLACK, bg);
+        drawTaskIcon(entry.title, ux + 6, uy + 4);
+        fb.drawString(ux + 28, uy + 7, entry.title, colors.BLACK, bg);
     }
 
     const clock_w: u32 = 66;
@@ -305,7 +376,8 @@ pub fn draw(start_menu_open: bool, programs_flyout_open: bool, entries: []const 
     }
     fb.fillRect(clock_x, btn_y, clock_w, btn_h, colors.GREY);
     draw3DBorder(clock_x, btn_y, clock_w, btn_h, false);
-    fb.drawString(clock_x + 12, btn_y + 8, "12:00", colors.BLACK, colors.GREY);
+    var clock_buf: [5]u8 = undefined;
+    fb.drawString(clock_x + 12, btn_y + 8, formatClock(&clock_buf), colors.BLACK, colors.GREY);
 
     if (start_menu_open) drawStartMenu(programs_flyout_open);
 }

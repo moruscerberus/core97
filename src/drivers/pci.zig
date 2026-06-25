@@ -211,3 +211,69 @@ pub fn scanAll() void {
 pub fn scanForUhci() void {
     scanAll();
 }
+
+// --- Public config-space accessors + capability-list walking ---
+// Needed by drivers/virtio_gpu.zig: the "modern" virtio-PCI transport
+// locates its register blocks via the standard PCI capability list
+// (PCI_STATUS bit 4 says one exists; PCI offset 0x34 points at the
+// first entry), not via a fixed BAR offset the way UHCI's I/O space
+// could just be used directly. This is standard PCI capability
+// discovery, not virtio-specific, so it lives here in pci.zig rather
+// than in the virtio driver itself.
+pub fn configReadU8(dev: PciDevice, offset: u8) u8 {
+    return pciConfigReadU8(dev.bus, dev.device, dev.function, offset);
+}
+pub fn configReadU16(dev: PciDevice, offset: u8) u16 {
+    return pciConfigReadU16(dev.bus, dev.device, dev.function, offset);
+}
+pub fn configReadU32(dev: PciDevice, offset: u8) u32 {
+    return pciConfigReadU32(dev.bus, dev.device, dev.function, offset);
+}
+
+const PCI_STATUS_OFFSET: u8 = 0x06;
+const PCI_STATUS_CAPLIST: u16 = 0x10;
+const PCI_CAPABILITIES_PTR_OFFSET: u8 = 0x34;
+
+/// Finds the offset of the first capability with the given ID at or
+/// after `start_after` in the capability list (0 to start from the
+/// beginning). Returns null if the device has no capability list, or
+/// no (further) capability with that ID exists. Pass the previous
+/// result back in as `start_after` to enumerate multiple capabilities
+/// sharing the same ID (virtio devices expose several
+/// vendor-specific (0x09) capabilities - one per cfg_type).
+pub fn findCapability(dev: PciDevice, cap_id: u8, start_after: u8) ?u8 {
+    const status = configReadU16(dev, PCI_STATUS_OFFSET);
+    if ((status & PCI_STATUS_CAPLIST) == 0) return null;
+
+    var ptr = configReadU8(dev, PCI_CAPABILITIES_PTR_OFFSET);
+    var guard: u8 = 0; // malformed/cyclic capability lists must not hang the scan
+    while (ptr != 0 and guard < 64) : (guard += 1) {
+        const this_id = configReadU8(dev, ptr);
+        const next_ptr = configReadU8(dev, ptr + 1);
+        if (this_id == cap_id and ptr > start_after) return ptr;
+        ptr = next_ptr;
+    }
+    return null;
+}
+
+/// Resolves BAR `index` (0-5) to a usable physical address. Handles
+/// both 32-bit and 64-bit memory BARs (a 64-bit BAR's high 32 bits live
+/// in the NEXT BAR slot, per the PCI spec) - virtio's modern transport
+/// commonly uses 64-bit BARs for its capability regions, unlike UHCI's
+/// plain 32-bit I/O BAR this file was originally written against.
+/// Returns null for I/O-space BARs (bit 0 set) - callers that need MMIO
+/// should always get a real address here, not an I/O port number.
+pub fn barAddress(dev: PciDevice, index: u8) ?u64 {
+    const bars = [_]u32{ dev.bar0, dev.bar1, dev.bar2, dev.bar3, dev.bar4, dev.bar5 };
+    if (index >= bars.len) return null;
+    const bar = bars[index];
+    if ((bar & 0x1) != 0) return null; // I/O space BAR, not memory
+
+    const is_64bit = ((bar >> 1) & 0x3) == 0x2;
+    const base_low: u64 = bar & 0xFFFFFFF0;
+    if (!is_64bit) return base_low;
+
+    if (index + 1 >= bars.len) return null; // malformed: 64-bit BAR with no upper half
+    const base_high: u64 = bars[index + 1];
+    return (base_high << 32) | base_low;
+}

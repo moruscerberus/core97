@@ -161,7 +161,7 @@ const Browser = struct {
         const start: usize = if (text.len > max_chars) text.len - max_chars else 0;
         const shown = text[start..text.len];
         fb.drawString(x + 6, y + 6, shown, fb.CORE97_BLACK, bg);
-        if (active) fb.fillRect(x + 7 + @as(u32, @intCast(shown.len)) * 6, y + 4, 2, 12, fb.CORE97_BLACK);
+        if (active) fb.fillRect(x + 7 + fb.textWidth(shown), y + 4, 2, 12, fb.CORE97_BLACK);
     }
     fn drawLink(_: *Browser, x: u32, y: u32, label: []const u8, detail: []const u8) void {
         const hovered = ui.hit(x, y - 2, 390, 20);
@@ -176,7 +176,7 @@ const Browser = struct {
     }
 
     fn drawCenteredText(x: u32, y: u32, w: u32, text: []const u8, color: u32) void {
-        const tw: u32 = @as(u32, @intCast(text.len)) * 6;
+        const tw: u32 = fb.textWidth(text);
         const dx = if (w > tw) x + (w - tw) / 2 else x;
         fb.drawString(dx, y, text, color, fb.CORE97_WHITE);
     }

@@ -195,6 +195,7 @@ pub fn seedCore97Files() void {
     const def = ensureDirectory(users, "default") orelse return;
     const system = ensureDirectory(root, "system") orelse return;
     const apps = ensureDirectory(root, "apps") orelse return;
+    _ = ensureDirectory(root, "Trash");
 
     const notes = ensureFile(def, "notes.txt") orelse return;
     if (readFile(notes).len == 0) {
@@ -278,6 +279,73 @@ pub fn createUniqueTextFile(parent: NodeHandle) ?NodeHandle {
     return null;
 }
 
+/// Moves `handle` (file or directory - works for both, since only the
+/// node's own parent link changes, not anything about its children)
+/// from its current parent to `new_parent`. If a child with the same
+/// name already exists there, tries "name (2)", "name (3)", ... up to
+/// (9) before giving up. Returns false (leaving everything unchanged)
+/// if new_parent isn't a directory, is full, or every numbered name is
+/// also already taken.
+///
+/// This is the actual mechanism behind the Trash feature (moving a
+/// file/folder into the Trash directory created in seedCore97Files(),
+/// and back out again to restore it) - "delete" never destroys data
+/// here, it just relocates it, the same as a real desktop's recycle
+/// bin/trash.
+pub fn moveNode(handle: NodeHandle, new_parent: NodeHandle) bool {
+    if (!validHandle(handle) or !validHandle(new_parent)) return false;
+    if (nodes[new_parent].kind != .directory) return false;
+    const old_parent = nodes[handle].parent;
+    if (old_parent == new_parent) return true; // already there - not an error
+
+    var final_name_buf: [MAX_NAME_LEN]u8 = undefined;
+    var final_name: []const u8 = nameOf(handle);
+    if (findChild(new_parent, final_name) != null) {
+        var suffix: u8 = 2;
+        var found = false;
+        while (suffix <= 9) : (suffix += 1) {
+            var len: usize = 0;
+            const orig = nameOf(handle);
+            const max_base = if (orig.len + 5 > final_name_buf.len) final_name_buf.len - 5 else orig.len;
+            var i: usize = 0;
+            while (i < max_base) : (i += 1) { final_name_buf[len] = orig[i]; len += 1; }
+            final_name_buf[len] = ' '; len += 1;
+            final_name_buf[len] = '('; len += 1;
+            final_name_buf[len] = '0' + suffix; len += 1;
+            final_name_buf[len] = ')'; len += 1;
+            const candidate = final_name_buf[0..len];
+            if (findChild(new_parent, candidate) == null) {
+                final_name = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    if (nodes[new_parent].child_count >= MAX_CHILDREN) return false;
+
+    // Remove from old parent's children array (same shift-down pattern
+    // deleteChild uses, just without destroying the node).
+    var i: usize = 0;
+    while (i < nodes[old_parent].child_count) : (i += 1) {
+        if (nodes[old_parent].children[i] == handle) {
+            var j = i + 1;
+            while (j < nodes[old_parent].child_count) : (j += 1) {
+                nodes[old_parent].children[j - 1] = nodes[old_parent].children[j];
+            }
+            nodes[old_parent].child_count -= 1;
+            nodes[old_parent].children[nodes[old_parent].child_count] = INVALID;
+            break;
+        }
+    }
+
+    if (!eqlName(handle, final_name)) setName(handle, final_name);
+    nodes[handle].parent = new_parent;
+    nodes[new_parent].children[nodes[new_parent].child_count] = handle;
+    nodes[new_parent].child_count += 1;
+    return true;
+}
+
 fn deleteRecursive(handle: NodeHandle) void {
     if (!validHandle(handle)) return;
     if (nodes[handle].kind == .directory) {
@@ -338,6 +406,7 @@ pub fn renameChild(parent: NodeHandle, old_name: []const u8, new_name: []const u
 }
 
 pub fn maxNodes() usize { return MAX_NODES; }
+pub fn trashFolder() ?NodeHandle { return resolvePath("/Trash"); }
 pub fn usedNodes() usize {
     var count: usize = 0;
     var i: usize = 0;

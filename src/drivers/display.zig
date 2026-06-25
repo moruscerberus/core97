@@ -29,7 +29,7 @@ pub fn firstAdapter() ?pci.PciDevice {
 }
 
 pub fn modeText() []const u8 {
-    if (fb.fb_width >= 1280 or fb.fb_height >= 900) return "linear framebuffer, hi-res scaling";
+    if (fb.fb_width >= 1280 or fb.fb_height >= 900) return "dynamic linear framebuffer";
     if (fb.fb_width >= 800 or fb.fb_height >= 600) return "linear framebuffer";
-    return "linear framebuffer, compact mode";
+    return "dynamic linear framebuffer, compact";
 }

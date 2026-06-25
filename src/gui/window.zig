@@ -13,11 +13,27 @@ fn ditherShadow(x: u32, y: u32, w: u32, h: u32) void {
     }
 }
 
+
+fn drawTitleIcon(x: u32, y: u32) void {
+    fb.fillRect(x, y, 15, 15, fb.CORE97_GREY);
+    fb.draw3DBorder(x, y, 15, 15, true);
+    fb.fillRect(x + 3, y + 3, 9, 7, 0x102060);
+    fb.fillRect(x + 5, y + 11, 5, 1, fb.CORE97_DARK_GREY);
+    fb.fillRect(x + 4, y + 12, 7, 1, fb.CORE97_DARK_GREY);
+    fb.putPixel(x + 5, y + 5, 0x00FFFF);
+}
+
+fn drawTitleGradient(x: u32, y: u32, w: u32, h: u32) void {
+    // Windows 95 uses a flat active-title blue rather than gradients.
+    fb.fillRect(x, y, w, h, fb.CORE97_BLUE);
+}
+
 fn drawTitlebarButton(x: u32, y: u32) void {
     const w: u32 = 16;
     const h: u32 = 14;
     const hovered = ui.hit(x, y, w, h);
-    fb.fillRect(x, y, w, h, if (hovered) 0xD8E8FF else fb.CORE97_GREY);
+    _ = hovered;
+    fb.fillRect(x, y, w, h, fb.CORE97_GREY);
     fb.draw3DBorder(x, y, w, h, true);
 }
 
@@ -60,10 +76,11 @@ pub fn drawChrome(x: i32, y: i32, w: u32, h: u32, title: []const u8) void {
 
     fb.fillRect(ux, uy, w, h, fb.CORE97_GREY);
     fb.draw3DBorder(ux, uy, w, h, true);
-    fb.fillRect(ux + 2, uy + 2, w - 4, 18, fb.CORE97_BLUE);
-    fb.drawString(ux + 8, uy + 7, title, fb.CORE97_WHITE, fb.CORE97_BLUE);
+    drawTitleGradient(ux + 2, uy + 2, w - 4, 20);
+    drawTitleIcon(ux + 5, uy + 4);
+    fb.drawString(ux + 25, uy + 8, title, fb.CORE97_WHITE, 0x000080);
 
-    const btn_y = uy + 3;
+    const btn_y = uy + 4;
     const btn_spacing: u32 = 18;
     const close_x = ux + w - 2 - 16;
     const maximize_x = close_x - btn_spacing;
@@ -94,6 +111,7 @@ pub fn drawEditorPane(x: u32, y: u32, w: u32, h: u32) void {
 const animation = @import("animation.zig");
 const taskbar = @import("taskbar.zig");
 const tasks = @import("../kernel/tasks.zig");
+const audio = @import("../drivers/audio.zig");
 pub const Rect = animation.Rect;
 
 pub const MouseButton = enum { left, right };
@@ -251,7 +269,7 @@ pub fn appFrom(comptime T: type, instance: *T) App {
     return .{ .ptr = instance, .vtable = &Trampoline.vtable };
 }
 
-const TITLEBAR_H: u32 = 20;
+const TITLEBAR_H: u32 = 22;
 
 fn pointInRect(mx: i32, my: i32, x: i32, y: i32, w: u32, h: u32) bool {
     return mx >= x and my >= y and mx < x + @as(i32, @intCast(w)) and my < y + @as(i32, @intCast(h));
@@ -389,7 +407,7 @@ pub const WindowManager = struct {
     }
 
     fn maxRect() Rect {
-        return .{ .x = 0, .y = 0, .w = fb.fb_width, .h = fb.fb_height - taskbar.HEIGHT };
+        return .{ .x = 0, .y = 0, .w = fb.fb_width, .h = fb.fb_height - taskbar.height() };
     }
 
     fn taskbarSlotOf(self: *WindowManager, slot: usize) u32 {
@@ -425,6 +443,67 @@ pub const WindowManager = struct {
         tasks.bumpSwitch(slot);
     }
 
+    /// Alt+Tab: focuses the next open (non-closed) window below the
+    /// current one in z-order, restoring it first if it was minimized.
+    /// close() leaves closed windows sitting in `order` rather than
+    /// removing them (see close()'s comment), so this has to actively
+    /// skip them rather than assume every entry is open - scanning from
+    /// the top down and skipping both closed slots and the current
+    /// focus naturally finds "the next one down", and repeated presses
+    /// walk through every open window in turn since restore() re-bumps
+    /// whatever it picks to the very top each time.
+    pub fn cycleFocus(self: *WindowManager) void {
+        if (self.order_len < 2) return;
+        const current = self.focused();
+        var i: usize = self.order_len;
+        while (i > 0) {
+            i -= 1;
+            const slot = self.order[i];
+            const w = self.windows[slot] orelse continue;
+            if (w.state == .closed) continue;
+            if (current != null and slot == current.?) continue;
+            self.restore(slot);
+            return;
+        }
+    }
+
+    fn clampWindowToScreen(w: *ManagedWindow) void {
+        const max_w = fb.fb_width;
+        const max_h = if (fb.fb_height > taskbar.height()) fb.fb_height - taskbar.height() else fb.fb_height;
+        if (w.w > max_w) w.w = max_w;
+        if (w.h > max_h) w.h = max_h;
+        if (w.x < 0) w.x = 0;
+        if (w.y < 0) w.y = 0;
+        const right_limit: i32 = @as(i32, @intCast(max_w)) - @as(i32, @intCast(if (w.w < 20) w.w else 20));
+        const bottom_limit: i32 = @as(i32, @intCast(max_h)) - 20;
+        if (w.x > right_limit) w.x = right_limit;
+        if (w.y > bottom_limit) w.y = bottom_limit;
+        if (w.x < 0) w.x = 0;
+        if (w.y < 0) w.y = 0;
+    }
+
+    pub fn onScreenResize(self: *WindowManager) void {
+        var i: usize = 0;
+        while (i < MAX_WINDOWS) : (i += 1) {
+            if (self.windows[i]) |*w| {
+                if (w.state == .maximized) {
+                    const m = maxRect();
+                    w.x = m.x;
+                    w.y = m.y;
+                    w.w = m.w;
+                    w.h = m.h;
+                } else {
+                    clampWindowToScreen(w);
+                    if (w.normal_w > fb.fb_width) w.normal_w = fb.fb_width;
+                    const max_h = if (fb.fb_height > taskbar.height()) fb.fb_height - taskbar.height() else fb.fb_height;
+                    if (w.normal_h > max_h) w.normal_h = max_h;
+                }
+            }
+        }
+        self.dragging = null;
+        self.resizing = null;
+    }
+
     pub fn restore(self: *WindowManager, slot: usize) void {
         const w: *ManagedWindow = if (self.windows[slot]) |*win| win else return;
         if (w.state == .closed) {
@@ -435,6 +514,7 @@ pub const WindowManager = struct {
             animation.animateRect(smallCenterOf(w.*), w.rect());
             w.state = .normal;
             tasks.setState(slot, .running);
+            audio.openSound();
         } else if (w.state == .minimized) {
             animation.animateRect(self.taskbarRectFor(slot), w.rect());
             w.state = .normal;
@@ -514,7 +594,7 @@ pub const WindowManager = struct {
             if (detail.len != 0) {
                 const safe_x: i32 = if (w.x < 0) 0 else w.x;
                 const safe_y: i32 = if (w.y < 0) 0 else w.y;
-                fb.drawString(@intCast(safe_x + 84), @intCast(safe_y + 7), detail, fb.CORE97_WHITE, fb.CORE97_BLUE);
+                fb.drawString(@intCast(safe_x + 90), @intCast(safe_y + 8), detail, fb.CORE97_WHITE, 0x000080);
             }
             const area = self.contentArea(slot);
             if (area.w > 0 and area.h > 0) {
@@ -706,7 +786,7 @@ pub const WindowManager = struct {
             w.x = mx - self.drag_offset_x;
             w.y = my - self.drag_offset_y;
             const max_x: i32 = @as(i32, @intCast(fb.fb_width)) - 20;
-            const max_y: i32 = @as(i32, @intCast(fb.fb_height)) - 20 - @as(i32, @intCast(taskbar.HEIGHT));
+            const max_y: i32 = @as(i32, @intCast(fb.fb_height)) - 20 - @as(i32, @intCast(taskbar.height()));
             if (w.x < 0) w.x = 0;
             if (w.y < 0) w.y = 0;
             if (w.x > max_x) w.x = max_x;

@@ -5,33 +5,61 @@
 const colors = @import("colors.zig");
 const font = @import("font.zig");
 
-// --- Framebuffer state (set once by kernel_main from Multiboot info) ---
-pub var fb_addr: usize = 0;
-pub var fb_pitch: u32 = 0;
-pub var fb_width: u32 = 0;
-pub var fb_height: u32 = 0;
-pub var fb_bpp: u8 = 0;
+// --- Dynamic framebuffer canvas ---
+//
+// Core97 now treats fb_width/fb_height as the live desktop size, not a
+// hard-coded design resolution. That means QEMU, VirtualBox, and bare metal
+// all use the same GUI code path:
+//   * Boot: GRUB's multiboot framebuffer size becomes the desktop size.
+//   * QEMU/VirtualBox std/VBoxVGA: the Bochs VBE driver can switch modes.
+//   * QEMU virtio-gpu: optional polling can ask the host for its preferred
+//     scanout size, then the same VBE path applies the new mode.
+//   * Bare metal: if runtime VBE mode setting is unavailable, the boot
+//     framebuffer still works and the desktop lays out against that size.
+//
+// This deliberately avoids stretching a fixed 1280x800 image. Text, icons,
+// menus, hit testing, taskbar placement, and windows all operate directly in
+// real pixels, so the UI stays crisp. The backbuffer is a maximum-sized static
+// canvas; only the active fb_width x fb_height region is used.
+pub const MAX_WIDTH: u32 = 1920;
+pub const MAX_HEIGHT: u32 = 1200;
+pub const MAX_PIXELS: usize = @as(usize, MAX_WIDTH) * @as(usize, MAX_HEIGHT);
 
-// --- Double buffering ---
-// Drawing directly to framebuffer memory pixel-by-pixel causes visible
-// flicker (we see the screen mid-redraw, especially during fast mouse
-// movement that triggers many redraws/second). The fix: draw everything
-// to a buffer in regular RAM, then copy the ENTIRE buffer to the screen
-// in a single sweep once we're done.
-// Sized generously rather than exactly 1024x768, since boot.asm no
-// longer demands that specific resolution - the bootloader picks
-// whatever it thinks is appropriate (see boot.asm's multiboot header),
-// and this needs to be able to hold whatever that turns out to be.
-// 1920x1200 comfortably covers the VESA modes a BIOS/VBE is likely to
-// offer; kernel.zig refuses to boot into anything bigger than this
-// rather than silently rendering a partial/corrupted screen.
-pub const MAX_BACKBUFFER_PIXELS: usize = 1920 * 1200;
-var backbuffer: [MAX_BACKBUFFER_PIXELS]u32 = undefined;
+pub var fb_width: u32 = 640;
+pub var fb_height: u32 = 480;
+pub var resize_generation: u32 = 0;
+
+pub fn configureCanvas(width: u32, height: u32) void {
+    if (width == 0 or height == 0) return;
+    const new_w = if (width > MAX_WIDTH) MAX_WIDTH else width;
+    const new_h = if (height > MAX_HEIGHT) MAX_HEIGHT else height;
+    if (new_w != fb_width or new_h != fb_height) resize_generation +%= 1;
+    fb_width = new_w;
+    fb_height = new_h;
+}
+
+// --- Real hardware framebuffer (set by kernel_main from Multiboot and by
+// runtime mode drivers such as drivers/vbe.zig). Most GUI code should only use
+// fb_width/fb_height and the drawing primitives above it.
+pub var real_fb_addr: usize = 0;
+pub var real_fb_pitch: u32 = 0;
+pub var real_fb_width: u32 = 0;
+pub var real_fb_height: u32 = 0;
+pub var real_fb_bpp: u8 = 0;
+
+// One static maximum-sized backbuffer. Dynamic allocation would be nicer, but
+// this kernel is still early enough that a bounded static buffer is safer and
+// works consistently on emulators and real machines.
+var backbuffer: [MAX_PIXELS]u32 = undefined;
+
+inline fn activeIndex(x: u32, y: u32) usize {
+    return @as(usize, y) * @as(usize, MAX_WIDTH) + @as(usize, x);
+}
 
 // Sets a pixel in the back buffer (NOT directly on screen)
 pub fn putPixel(x: u32, y: u32, color: u32) void {
     if (x >= fb_width or y >= fb_height) return;
-    const idx = y * fb_width + x;
+    const idx = activeIndex(x, y);
     if (idx >= backbuffer.len) return;
     backbuffer[idx] = color;
 }
@@ -43,65 +71,85 @@ pub fn fillRect(x: u32, y: u32, w: u32, h: u32, color: u32) void {
 
     var row: u32 = y;
     while (row < y_end) : (row += 1) {
-        const row_start = row * fb_width + x;
-        const row_end = row * fb_width + x_end;
+        const row_start = activeIndex(x, row);
+        const row_end = activeIndex(x_end, row);
         if (row_end > backbuffer.len) continue;
         @memset(backbuffer[row_start..row_end], color);
     }
 }
 
-// Copies the entire back buffer to the real screen in one sweep.
-// Must be called once at the END of every frame, never mid-frame.
-//
-// This used to be a putPixel-style loop: one volatile store *and* one
-// fresh `row*pitch + x*bpp` address recompute *and* one bounds check,
-// per pixel, every single frame. At 1024x768 that's ~786k of all of the
-// above per present - and since this OS calls present on every mouse
-// IRQ, that cost was the actual root of the "feels sluggish" complaint.
-// A plain framebuffer write has no MMIO side effects worth worrying
-// about, so a bulk @memcpy (one per row, or a single one when the video
-// mode has no row padding) is both correct and dramatically cheaper.
-pub fn presentFrame() void {
-    const total_raw: usize = @as(usize, fb_width) * @as(usize, fb_height);
-    const total = if (total_raw > backbuffer.len) backbuffer.len else total_raw;
-    const bytes_per_pixel = fb_bpp / 8;
+inline fn writeRealPixel(rx: u32, ry: u32, color: u32) void {
+    const bytes_per_pixel = real_fb_bpp / 8;
+    const offset = real_fb_addr + @as(usize, ry) * @as(usize, real_fb_pitch) + @as(usize, rx) * @as(usize, bytes_per_pixel);
+    const dest: *u32 = @ptrFromInt(offset);
+    dest.* = color;
+}
 
-    if (fb_pitch == fb_width * bytes_per_pixel) {
-        const dest: [*]u32 = @ptrFromInt(fb_addr);
-        @memcpy(dest[0..total], backbuffer[0..total]);
-        return;
-    }
+fn presentRows(x0: u32, y0: u32, x1: u32, y1: u32) void {
+    if (real_fb_addr == 0 or real_fb_bpp != 32) return;
+    if (fb_width == 0 or fb_height == 0) return;
 
-    // Fallback for a padded row pitch (not the mode this kernel asks
-    // for, but keep it correct if a different one ever gets negotiated).
-    var y: u32 = 0;
-    while (y < fb_height) : (y += 1) {
-        const src_start = y * fb_width;
-        if (src_start >= backbuffer.len) break;
-        const src_end = if (src_start + fb_width > backbuffer.len) backbuffer.len else src_start + fb_width;
-        const dest_row: [*]u32 = @ptrFromInt(fb_addr + y * fb_pitch);
-        @memcpy(dest_row[0 .. src_end - src_start], backbuffer[src_start..src_end]);
+    const max_x = if (x1 > fb_width) fb_width else x1;
+    const max_y = if (y1 > fb_height) fb_height else y1;
+    if (max_x <= x0 or max_y <= y0) return;
+
+    const bytes_per_pixel = real_fb_bpp / 8;
+    const copy_w: usize = @intCast(max_x - x0);
+    var y = y0;
+    while (y < max_y) : (y += 1) {
+        const src_start = activeIndex(x0, y);
+        const dest_row: [*]u32 = @ptrFromInt(real_fb_addr + @as(usize, y) * @as(usize, real_fb_pitch) + @as(usize, x0) * @as(usize, bytes_per_pixel));
+        @memcpy(dest_row[0..copy_w], backbuffer[src_start .. src_start + copy_w]);
     }
 }
 
-/// Copies only one rectangle from the backbuffer to the real framebuffer.
-/// This is used while dragging windows to reduce tearing/slowness compared
-/// with a full-screen present every mouse packet.
+// Copies the active desktop-size backbuffer to the real screen.
+//
+// Important: never stretch the desktop here. QEMU/VirtualBox can scale the
+// host window, but the OS renderer must stay pixel-perfect. If the logical
+// canvas and hardware framebuffer ever differ, we copy the overlapping region
+// 1:1 and clear the unused area instead of nearest-neighbour scaling. Scaling
+// the framebuffer was what made the shell font look fat, blurry, and uneven.
+pub fn presentFrame() void {
+    if (real_fb_addr == 0) return;
+    if (real_fb_width == fb_width and real_fb_height == fb_height) {
+        presentRows(0, 0, fb_width, fb_height);
+        return;
+    }
+
+    if (real_fb_width == 0 or real_fb_height == 0) return;
+
+    const copy_w = if (fb_width < real_fb_width) fb_width else real_fb_width;
+    const copy_h = if (fb_height < real_fb_height) fb_height else real_fb_height;
+    presentRows(0, 0, copy_w, copy_h);
+
+    // Clear any exposed hardware-only area. This path should be rare; normal
+    // boot and vbe.setMode() keep canvas and hardware mode identical.
+    var y: u32 = 0;
+    while (y < real_fb_height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < real_fb_width) : (x += 1) {
+            if (x >= copy_w or y >= copy_h) writeRealPixel(x, y, CORE97_TEAL);
+        }
+    }
+}
+
+/// Copies only a rectangle. Coordinates are live desktop pixels, not a fixed
+/// virtual design space.
 pub fn presentRect(x0: u32, y0: u32, w0: u32, h0: u32) void {
+    if (real_fb_addr == 0) return;
     if (x0 >= fb_width or y0 >= fb_height) return;
     const max_x = if (x0 + w0 > fb_width) fb_width else x0 + w0;
     const max_y = if (y0 + h0 > fb_height) fb_height else y0 + h0;
     if (max_x <= x0 or max_y <= y0) return;
-    const row_w = max_x - x0;
-    const bytes_per_pixel = fb_bpp / 8;
 
-    var y: u32 = y0;
-    while (y < max_y) : (y += 1) {
-        const src_start = y * fb_width + x0;
-        if (src_start >= backbuffer.len) continue;
-        const src_end = if (src_start + row_w > backbuffer.len) backbuffer.len else src_start + row_w;
-        const dest_row: [*]u32 = @ptrFromInt(fb_addr + y * fb_pitch + x0 * bytes_per_pixel);
-        @memcpy(dest_row[0 .. src_end - src_start], backbuffer[src_start..src_end]);
+    if (real_fb_width == fb_width and real_fb_height == fb_height) {
+        presentRows(x0, y0, max_x, max_y);
+    } else {
+        // Mismatched fallback: update the whole scaled frame. This path should
+        // be rare; vbe.setMode() and boot configureCanvas() normally keep both
+        // sizes equal.
+        presentFrame();
     }
 }
 
@@ -168,14 +216,57 @@ pub fn drawDashedRect(x: i32, y: i32, w: u32, h: u32, color: u32) void {
     }
 }
 
+// Core97 shell font metrics.
+//
+// The previous build scaled the 5x7 bitmap glyphs into a 7x11 cell. That made
+// the UI larger, but because a 5x7 grid cannot scale evenly to 7x11, strokes
+// became irregular and letters looked fuzzy after VM window scaling.
+//
+// This renderer is intentionally strict: one source pixel becomes exactly one
+// framebuffer pixel. The cell is 6x8: 5 visible glyph columns, one blank
+// spacer column, seven visible glyph rows, one blank descender/baseline row.
+// It is not a copied Microsoft font; it is Core97's own tiny bitmap font drawn
+// with Win95-era proportions and pixel-perfect rules.
+pub const FONT_W: u32 = 6;  // base bitmap cell width at 1x
+pub const FONT_H: u32 = 8;  // base bitmap cell height at 1x
+pub const FONT_ADV: u32 = 6; // base advance at 1x
+
+/// Global shell UI scale.  Core97 deliberately uses integer scale buckets:
+/// generated icons/text are redrawn at 1x/2x instead of stretching a finished
+/// framebuffer.  This keeps the 1995 pixel-art look crisp on 2026 displays.
+pub fn uiScale() u32 {
+    // Very wide fullscreen modes reported by QEMU/VirtualBox otherwise make
+    // the shell feel microscopic.  Height OR width may trigger 2x because some
+    // hosts expose ultrawide temporary surfaces such as 2048x576.
+    if (fb_width >= 1600 or fb_height >= 900) return 2;
+    return 1;
+}
+
+pub fn fontCellWidth() u32 { return FONT_W * uiScale(); }
+pub fn fontHeight() u32 { return FONT_H * uiScale(); }
+pub fn fontAdvance() u32 { return FONT_ADV * uiScale(); }
+
+pub fn textWidth(text: []const u8) u32 {
+    return @as(u32, @intCast(text.len)) * fontAdvance();
+}
+
+fn glyphOn(c: u8, src_col: u32, src_row: u32) bool {
+    if (src_col >= 5 or src_row >= 7) return false;
+    const bits = font.glyphRow(c, @intCast(src_row));
+    const mask: u8 = @as(u8, 1) << @intCast(4 - src_col);
+    return (bits & mask) != 0;
+}
+
 pub fn drawChar(x: u32, y: u32, c: u8, fg: u32, bg: u32) void {
-    var row: usize = 0;
-    while (row < 7) : (row += 1) {
-        const bits = font.glyphRow(c, row);
+    // Pixel-perfect bitmap text. At high resolutions one source pixel becomes
+    // an integer NxN block.  No interpolation, no fractional coordinates, no
+    // scaling of the already-rendered framebuffer.
+    const s = uiScale();
+    var row: u32 = 0;
+    while (row < FONT_H) : (row += 1) {
         var col: u32 = 0;
-        while (col < 5) : (col += 1) {
-            const mask: u8 = @as(u8, 1) << @intCast(4 - col);
-            putPixel(x + col, y + @as(u32, @intCast(row)), if ((bits & mask) != 0) fg else bg);
+        while (col < FONT_W) : (col += 1) {
+            fillRect(x + col * s, y + row * s, s, s, if (glyphOn(c, col, row)) fg else bg);
         }
     }
 }
@@ -184,24 +275,32 @@ pub fn drawString(x: u32, y: u32, text: []const u8, fg: u32, bg: u32) void {
     var cx = x;
     for (text) |c| {
         drawChar(cx, y, c, fg, bg);
-        cx += 6;
+        cx += fontAdvance();
     }
 }
 
-// Same 5x7 glyph data as drawChar, but rotated 90 degrees so the text
-// reads going down the screen instead of across it - used for the
-// "CORE 97" logo strip on the side of the Start menu. Each glyph's original
-// (col, row) pixel maps to (x + row, y + (4 - col)): the old left-right
-// axis becomes the new top-bottom axis.
+// Same 5x7 glyph data as drawChar, but rotated 90 degrees clockwise so
+// the text reads correctly going DOWN the screen without tilting your
+// head - used for the "CORE 97" logo strip on the side of the Start
+// menu. Each glyph's original (col, row) pixel maps to
+// (x + (6 - row), y + col): the old left-right axis becomes the new
+// top-bottom axis.
+//
+// Direction matters here, not just "rotated": rotating the other way
+// (counter-clockwise) produces letters whose correct reading direction
+// is bottom-to-top, which - combined with drawStringVertical drawing
+// the first character at the smallest y (i.e. the top) - made the
+// whole string read backwards top-to-bottom ("CORE 97" appeared as
+// "79 EROC"). Clockwise rotation's natural top-to-bottom reading
+// direction matches drawStringVertical's iteration order with no
+// further changes needed there.
 pub fn drawCharVertical(x: u32, y: u32, c: u8, fg: u32, bg: u32) void {
-    var row: usize = 0;
-    while (row < 7) : (row += 1) {
-        const bits = font.glyphRow(c, row);
+    const s = uiScale();
+    var row: u32 = 0;
+    while (row < FONT_H) : (row += 1) {
         var col: u32 = 0;
-        while (col < 5) : (col += 1) {
-            const mask: u8 = @as(u8, 1) << @intCast(4 - col);
-            const on = (bits & mask) != 0;
-            putPixel(x + @as(u32, @intCast(row)), y + (4 - col), if (on) fg else bg);
+        while (col < FONT_W) : (col += 1) {
+            fillRect(x + (FONT_H - 1 - row) * s, y + col * s, s, s, if (glyphOn(c, col, row)) fg else bg);
         }
     }
 }
@@ -210,6 +309,6 @@ pub fn drawStringVertical(x: u32, y: u32, text: []const u8, fg: u32, bg: u32) vo
     var cy = y;
     for (text) |c| {
         drawCharVertical(x, cy, c, fg, bg);
-        cy += 6;
+        cy += fontAdvance();
     }
 }
